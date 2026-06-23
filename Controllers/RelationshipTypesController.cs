@@ -5,33 +5,33 @@ using System.Linq;
 namespace I3X4Kusto.Controllers
 {
     [ApiController]
-    [Route("v0/relationshiptypes")]
+    [Route("v1/relationshiptypes")]
     public sealed class RelationshipTypesController : ControllerBase
     {
         private readonly ADXDataService _kusto;
 
         // Well-known OPC UA reference types exposed through this adapter
-        private static readonly List<I3xRelationshipType> KnownRelationshipTypes =
+        private static readonly List<RelationshipType> KnownRelationshipTypes =
         [
-            new("HasComponent", "HasComponent", "http://opcfoundation.org/UA/", "ComponentOf"),
-            new("Organizes", "Organizes", "http://opcfoundation.org/UA/", "OrganizedBy"),
-            new("HasProperty", "HasProperty", "http://opcfoundation.org/UA/", "PropertyOf"),
-            new("HasSubtype", "HasSubtype", "http://opcfoundation.org/UA/", "SubtypeOf"),
-            new("HasTypeDefinition", "HasTypeDefinition", "http://opcfoundation.org/UA/", "TypeDefinitionOf"),
-            new("HasModellingRule", "HasModellingRule", "http://opcfoundation.org/UA/", "ModellingRuleOf"),
-            new("HasEncoding", "HasEncoding", "http://opcfoundation.org/UA/", "EncodingOf"),
-            new("HasDescription", "HasDescription", "http://opcfoundation.org/UA/", "DescriptionOf"),
-            new("GeneratesEvent", "GeneratesEvent", "http://opcfoundation.org/UA/", "GeneratedBy"),
-            new("AlwaysGeneratesEvent", "AlwaysGeneratesEvent", "http://opcfoundation.org/UA/", "AlwaysGeneratedBy"),
-            new("HasNotifier", "HasNotifier", "http://opcfoundation.org/UA/", "NotifierOf"),
-            new("HasEventSource", "HasEventSource", "http://opcfoundation.org/UA/", "EventSourceOf"),
-            new("HasCondition", "HasCondition", "http://opcfoundation.org/UA/", "IsConditionOf"),
-            new("HasOrderedComponent", "HasOrderedComponent", "http://opcfoundation.org/UA/", "OrderedComponentOf"),
-            new("FromState", "FromState", "http://opcfoundation.org/UA/", "ToTransition"),
-            new("ToState", "ToState", "http://opcfoundation.org/UA/", "FromTransition"),
-            new("HasCause", "HasCause", "http://opcfoundation.org/UA/", "MayBeCausedBy"),
-            new("HasEffect", "HasEffect", "http://opcfoundation.org/UA/", "MayBeAffectedBy"),
-            new("HasGuard", "HasGuard", "http://opcfoundation.org/UA/", "GuardOf")
+            new("HasComponent", "HasComponent", "http://opcfoundation.org/UA/", "HasComponent", "ComponentOf"),
+            new("Organizes", "Organizes", "http://opcfoundation.org/UA/", "Organizes", "OrganizedBy"),
+            new("HasProperty", "HasProperty", "http://opcfoundation.org/UA/", "HasProperty", "PropertyOf"),
+            new("HasSubtype", "HasSubtype", "http://opcfoundation.org/UA/", "HasSubtype", "SubtypeOf"),
+            new("HasTypeDefinition", "HasTypeDefinition", "http://opcfoundation.org/UA/", "HasTypeDefinition", "TypeDefinitionOf"),
+            new("HasModellingRule", "HasModellingRule", "http://opcfoundation.org/UA/", "HasModellingRule", "ModellingRuleOf"),
+            new("HasEncoding", "HasEncoding", "http://opcfoundation.org/UA/", "HasEncoding", "EncodingOf"),
+            new("HasDescription", "HasDescription", "http://opcfoundation.org/UA/", "HasDescription", "DescriptionOf"),
+            new("GeneratesEvent", "GeneratesEvent", "http://opcfoundation.org/UA/", "GeneratesEvent", "GeneratedBy"),
+            new("AlwaysGeneratesEvent", "AlwaysGeneratesEvent", "http://opcfoundation.org/UA/", "AlwaysGeneratesEvent", "AlwaysGeneratedBy"),
+            new("HasNotifier", "HasNotifier", "http://opcfoundation.org/UA/", "HasNotifier", "NotifierOf"),
+            new("HasEventSource", "HasEventSource", "http://opcfoundation.org/UA/", "HasEventSource", "EventSourceOf"),
+            new("HasCondition", "HasCondition", "http://opcfoundation.org/UA/", "HasCondition", "IsConditionOf"),
+            new("HasOrderedComponent", "HasOrderedComponent", "http://opcfoundation.org/UA/", "HasOrderedComponent", "OrderedComponentOf"),
+            new("FromState", "FromState", "http://opcfoundation.org/UA/", "FromState", "ToTransition"),
+            new("ToState", "ToState", "http://opcfoundation.org/UA/", "ToState", "FromTransition"),
+            new("HasCause", "HasCause", "http://opcfoundation.org/UA/", "HasCause", "MayBeCausedBy"),
+            new("HasEffect", "HasEffect", "http://opcfoundation.org/UA/", "HasEffect", "MayBeAffectedBy"),
+            new("HasGuard", "HasGuard", "http://opcfoundation.org/UA/", "HasGuard", "GuardOf")
         ];
 
         public RelationshipTypesController(ADXDataService kusto)
@@ -41,21 +41,27 @@ namespace I3X4Kusto.Controllers
         }
 
         [HttpGet]
-        public ActionResult<IEnumerable<I3xRelationshipType>> GetRelationshipTypes()
+        public ActionResult<SuccessResponse<IReadOnlyList<RelationshipType>>> GetRelationshipTypes(
+            [FromQuery] string namespaceUri = null)
         {
             // No explicit relationship table in ADX – return well-known OPC UA reference types
-            return Ok(KnownRelationshipTypes);
+            IReadOnlyList<RelationshipType> results = string.IsNullOrEmpty(namespaceUri)
+                ? KnownRelationshipTypes
+                : KnownRelationshipTypes.Where(rt => rt.NamespaceUri == namespaceUri).ToList();
+
+            return Ok(new SuccessResponse<IReadOnlyList<RelationshipType>>(true, results));
         }
 
         [HttpPost("query")]
-        public ActionResult<IEnumerable<I3xRelationshipType>> QueryByElementId([FromBody] ElementIdQuery query)
+        public ActionResult<BulkResponse<RelationshipType>> QueryByElementId([FromBody] GetRelationshipTypesRequest request)
         {
-            var ids = new HashSet<string>(query.ElementIds);
-            var results = KnownRelationshipTypes
-                .Where(rt => ids.Contains(rt.ElementId))
-                .ToList();
+            var byId = KnownRelationshipTypes.ToDictionary(rt => rt.ElementId);
 
-            return Ok(results);
+            var items = request.ElementIds.Select(id => byId.TryGetValue(id, out var rt)
+                ? BulkResultItem<RelationshipType>.Ok(id, rt)
+                : BulkResultItem<RelationshipType>.NotFound(id, "Relationship type not found")).ToList();
+
+            return Ok(new BulkResponse<RelationshipType>(true, items));
         }
     }
 }

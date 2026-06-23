@@ -5,7 +5,7 @@ using System.Linq;
 namespace I3X4Kusto.Controllers
 {
     [ApiController]
-    [Route("v0/namespaces")]
+    [Route("v1/namespaces")]
     public sealed class NamespacesController : ControllerBase
     {
         private readonly ADXDataService _kusto;
@@ -17,19 +17,19 @@ namespace I3X4Kusto.Controllers
         }
 
         [HttpGet]
-        public ActionResult<IEnumerable<I3xNamespace>> GetNamespaces()
+        public ActionResult<SuccessResponse<IReadOnlyList<Namespace>>> GetNamespaces()
         {
             string query = "opcua_metadata_lkv\r\n"
                          + "| distinct NamespaceUri";
 
             var rows = _kusto.RunQueryRows(query);
 
-            var results = rows.Select(r => new I3xNamespace(
+            var results = rows.Select(r => new Namespace(
                 Str(r, "NamespaceUri"),
                 ExtractNameFromUri(Str(r, "NamespaceUri"))
             )).ToList();
 
-            return Ok(results);
+            return Ok(new SuccessResponse<IReadOnlyList<Namespace>>(true, results));
         }
 
         private static string ExtractNameFromUri(string uri)

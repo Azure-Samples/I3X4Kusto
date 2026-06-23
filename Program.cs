@@ -29,7 +29,7 @@ namespace I3X4Kusto
             app.UseSwagger();
             app.UseSwaggerUI(c =>
             {
-                c.SwaggerEndpoint("/swagger/v1/swagger.json", "i3X Kusto Adapter v0");
+                c.SwaggerEndpoint("/swagger/v1/swagger.json", "i3X Kusto Adapter v1");
             });
 
             app.UseHttpsRedirection();
