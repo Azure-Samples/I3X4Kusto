@@ -3,13 +3,11 @@ using Microsoft.AspNetCore.Mvc;
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
 
 namespace I3xKustoAdapter.Controllers
 {
     [ApiController]
-    [Route("v0/objects")]
+    [Route("v1/objects")]
     public sealed class ObjectsController : ControllerBase
     {
         private readonly ADXDataService _kusto;
@@ -21,53 +19,35 @@ namespace I3xKustoAdapter.Controllers
         }
 
         [HttpGet]
-        public async Task<ActionResult<IEnumerable<I3xObject>>> GetObjects(
-            [FromQuery] string typeId = null,
+        public ActionResult<SuccessResponse<IReadOnlyList<ObjectInstanceResponse>>> GetObjects(
+            [FromQuery] string typeElementId = null,
             [FromQuery] bool includeMetadata = false,
-            CancellationToken ct = default)
+            [FromQuery] bool? root = null)
         {
-            string query;
-            if (!string.IsNullOrEmpty(typeId))
+            string query = "opcua_metadata_lkv\r\n";
+            if (!string.IsNullOrEmpty(typeElementId))
             {
                 // Objects whose telemetry includes the given variable type
-                query = "opcua_metadata_lkv\r\n"
-                      + "| where Type == \"" + typeId + "\"\r\n"
-                      + "| project NodeId, DisplayName, Type, DataSetWriterID, NamespaceUri";
+                query += "| where Type in (" + ADXDataService.ToKqlStringList([typeElementId]) + ")\r\n";
             }
-            else
+            if (root == true)
             {
-                query = "opcua_metadata_lkv\r\n"
-                      + "| project NodeId, DisplayName, Type, DataSetWriterID, NamespaceUri";
+                // Root Objects are those without a parent node.
+                query += "| where isempty(NodeId)\r\n";
             }
+            query += "| project NodeId, DisplayName, Type, DataSetWriterID, NamespaceUri";
 
             var rows = _kusto.RunQueryRows(query);
 
-            if (includeMetadata)
-            {
-                return Ok(rows.Select(r =>
-                {
-                    var elementId = Str(r, "DataSetWriterID");
-                    var attrs = GetLatestAttributes(elementId);
-                    return new I3xObject(elementId, Str(r, "DisplayName"), Str(r, "Type"), false, Str(r, "NamespaceUri"), Str(r, "NodeId"), attrs);
-                }).ToList());
-            }
+            var results = rows.Select(r => MapObject(r, includeMetadata)).ToList();
 
-            return Ok(rows.Select(r => new I3xObject(
-                Str(r, "DataSetWriterID"),
-                Str(r, "DisplayName"),
-                Str(r, "Type"),
-                false,
-                Str(r, "NamespaceUri"),
-                Str(r, "NodeId")
-            )).ToList());
+            return Ok(new SuccessResponse<IReadOnlyList<ObjectInstanceResponse>>(true, results));
         }
 
         [HttpPost("list")]
-        public async Task<ActionResult<IEnumerable<I3xObject>>> ListObjects(
-            [FromBody] GetObjectsRequest req,
-            CancellationToken ct)
+        public ActionResult<BulkResponse<ObjectInstanceResponse>> ListObjects([FromBody] GetObjectsRequest request)
         {
-            string inClause = ADXDataService.ToKqlStringList(req.ElementIds);
+            string inClause = ADXDataService.ToKqlStringList(request.ElementIds);
 
             string query = "opcua_metadata_lkv\r\n"
                          + "| where DataSetWriterID in (" + inClause + ")\r\n"
@@ -75,60 +55,56 @@ namespace I3xKustoAdapter.Controllers
 
             var rows = _kusto.RunQueryRows(query);
 
-            return Ok(rows.Select(r => new I3xObject(
-                Str(r, "DataSetWriterID"),
-                Str(r, "DisplayName"),
-                Str(r, "Type"),
-                false,
-                Str(r, "NamespaceUri"),
-                Str(r, "NodeId")
-            )).ToList());
+            var byId = rows
+                .GroupBy(r => Str(r, "DataSetWriterID"))
+                .ToDictionary(g => g.Key, g => MapObject(g.First(), request.IncludeMetadata));
+
+            var items = request.ElementIds.Select(id => byId.TryGetValue(id, out var obj)
+                ? BulkResultItem<ObjectInstanceResponse>.Ok(id, obj)
+                : BulkResultItem<ObjectInstanceResponse>.NotFound(id, "Object not found")).ToList();
+
+            return Ok(new BulkResponse<ObjectInstanceResponse>(true, items));
         }
 
         [HttpPost("related")]
-        public async Task<ActionResult<IEnumerable<I3xObject>>> QueryRelatedObjects(
-            [FromBody] GetRelatedObjectsRequest req,
-            CancellationToken ct)
+        public ActionResult<BulkResponse<List<RelatedObjectResult>>> QueryRelatedObjects([FromBody] GetRelatedObjectsRequest request)
         {
-            string inClause = ADXDataService.ToKqlStringList(req.ElementIds);
+            string inClause = ADXDataService.ToKqlStringList(request.ElementIds);
+            string sourceRelationship = string.IsNullOrEmpty(request.RelationshipType) ? "HasComponent" : request.RelationshipType;
 
+            // Find sibling variables that share an Object (DataSetWriterID) with each requested element.
             string query = "opcua_metadata_lkv\r\n"
-                         + "| where DataSetWriterID in (\r\n"
+                         + "| where Name in (" + inClause + ")\r\n"
+                         + "| distinct DataSetWriterID, SourceName = Name\r\n"
+                         + "| join kind=inner (\r\n"
                          + "    opcua_metadata_lkv\r\n"
-                         + "    | where Name in (" + inClause + ")\r\n"
-                         + "    | distinct DataSetWriterID\r\n"
-                         + ")\r\n"
-                         + "| where Name !in (" + inClause + ")\r\n"
-                         + "| distinct DataSetWriterID, Name\r\n"
-                         + "| project ElementId = DataSetWriterID, ObjectTypeElementId = \"\", Name";
+                         + "    | distinct DataSetWriterID, Name, Type, NamespaceUri\r\n"
+                         + ") on DataSetWriterID\r\n"
+                         + "| where Name != SourceName\r\n"
+                         + "| project SourceName, ElementId = DataSetWriterID, DisplayName = Name, Type, NamespaceUri";
 
             var rows = _kusto.RunQueryRows(query);
 
-            if (req.IncludeMetadata)
-            {
-                return Ok(rows.Select(r =>
-                {
-                    var elementId = Str(r, "ElementId");
-                    var attrs = GetLatestAttributes(elementId);
-                    return new I3xObject(elementId, Str(r, "Name"), Str(r, "ObjectTypeElementId"), false, "", null, attrs);
-                }).ToList());
-            }
+            var bySource = rows
+                .GroupBy(r => Str(r, "SourceName"))
+                .ToDictionary(
+                    g => g.Key,
+                    g => g.Select(r => new RelatedObjectResult(
+                        sourceRelationship,
+                        MapRelatedObject(r, request.IncludeMetadata))).ToList());
 
-            return Ok(rows.Select(r => new I3xObject(
-                Str(r, "ElementId"),
-                Str(r, "Name"),
-                Str(r, "ObjectTypeElementId"),
-                false,
-                ""
-            )).ToList());
+            var items = request.ElementIds.Select(id =>
+                BulkResultItem<List<RelatedObjectResult>>.Ok(
+                    id,
+                    bySource.TryGetValue(id, out var related) ? related : new List<RelatedObjectResult>())).ToList();
+
+            return Ok(new BulkResponse<List<RelatedObjectResult>>(true, items));
         }
 
         [HttpPost("value")]
-        public async Task<ActionResult<IEnumerable<I3xValueResult>>> QueryValue(
-            [FromBody] I3xValueQueryRequest req,
-            CancellationToken ct)
+        public ActionResult<BulkResponse<CurrentValueResult>> QueryValue([FromBody] GetObjectValueRequest request)
         {
-            string inClause = ADXDataService.ToKqlStringList(req.ElementIds);
+            string inClause = ADXDataService.ToKqlStringList(request.ElementIds);
 
             string query = "opcua_telemetry\r\n"
                          + "| where DataSetWriterID in (" + inClause + ")\r\n"
@@ -139,40 +115,50 @@ namespace I3xKustoAdapter.Controllers
 
             var rows = _kusto.RunQueryRows(query);
 
-            // Group by DataSetWriterID to build one I3xValueResult per object
-            var results = rows
-                .GroupBy(r => Str(r, "DataSetWriterID"))
-                .Select(g =>
+            var byId = rows.GroupBy(r => Str(r, "DataSetWriterID"))
+                           .ToDictionary(g => g.Key, g => g.ToList());
+
+            var items = request.ElementIds.Select(id =>
+            {
+                if (!byId.TryGetValue(id, out var group))
                 {
-                    var attrs = new Dictionary<string, object>();
-                    DateTimeOffset latestTs = DateTimeOffset.MinValue;
+                    return BulkResultItem<CurrentValueResult>.NotFound(id, "No current value available");
+                }
 
-                    foreach (var row in g)
+                var components = new Dictionary<string, VQT>();
+                DateTime latest = DateTime.MinValue;
+
+                foreach (var row in group)
+                {
+                    string ts = "";
+                    if (row.TryGetValue("Timestamp", out var t) && t is DateTime dt)
                     {
-                        attrs[Str(row, "Name")] = row.GetValueOrDefault("Value");
-
-                        if (row.TryGetValue("Timestamp", out var ts) && ts is DateTime dt)
-                        {
-                            var offset = new DateTimeOffset(dt, TimeSpan.Zero);
-                            if (offset > latestTs) latestTs = offset;
-                        }
+                        if (dt > latest) latest = dt;
+                        ts = ToRfc3339(dt);
                     }
 
-                    return new I3xValueResult(g.Key, latestTs, attrs);
-                })
-                .ToList();
+                    components[Str(row, "Name")] = new VQT(row.GetValueOrDefault("Value"), "Good", ts);
+                }
 
-            return Ok(results);
+                var result = new CurrentValueResult(
+                    true,
+                    null,
+                    "Good",
+                    latest == DateTime.MinValue ? "" : ToRfc3339(latest),
+                    request.MaxDepth != 1 ? components : null);
+
+                return BulkResultItem<CurrentValueResult>.Ok(id, result);
+            }).ToList();
+
+            return Ok(new BulkResponse<CurrentValueResult>(true, items));
         }
 
         [HttpPost("history")]
-        public async Task<ActionResult<IEnumerable<I3xHistoryResult>>> QueryHistory(
-            [FromBody] I3xHistoryQueryRequest req,
-            CancellationToken ct)
+        public ActionResult<BulkResponse<HistoricalValueResult>> QueryHistory([FromBody] GetObjectHistoryRequest request)
         {
-            string inClause = ADXDataService.ToKqlStringList(req.ElementIds);
-            string start = req.StartTime ?? DateTime.UtcNow.AddHours(-1).ToString("o");
-            string end = req.EndTime ?? DateTime.UtcNow.ToString("o");
+            string inClause = ADXDataService.ToKqlStringList(request.ElementIds);
+            string start = request.StartTime ?? DateTime.UtcNow.AddHours(-1).ToString("o");
+            string end = request.EndTime ?? DateTime.UtcNow.ToString("o");
 
             string query = "opcua_telemetry\r\n"
                          + "| where DataSetWriterID in (" + inClause + ")\r\n"
@@ -182,60 +168,75 @@ namespace I3xKustoAdapter.Controllers
 
             var rows = _kusto.RunQueryRows(query);
 
-            var results = rows
-                .GroupBy(r => Str(r, "DataSetWriterID"))
-                .Select(g =>
+            var byId = rows.GroupBy(r => Str(r, "DataSetWriterID"))
+                           .ToDictionary(g => g.Key, g => g.ToList());
+
+            var items = request.ElementIds.Select(id =>
+            {
+                if (!byId.TryGetValue(id, out var group))
                 {
-                    var samples = g
-                        .GroupBy(r => r.GetValueOrDefault("Timestamp"))
-                        .Select(tg =>
+                    return BulkResultItem<HistoricalValueResult>.NotFound(id, "No historical values available");
+                }
+
+                var components = new Dictionary<string, object>();
+                foreach (var nameGroup in group.GroupBy(r => Str(r, "Name")))
+                {
+                    var vqts = nameGroup
+                        .Select(r => new
                         {
-                            var attrs = new Dictionary<string, object>();
-                            DateTimeOffset ts = DateTimeOffset.MinValue;
-
-                            foreach (var row in tg)
-                            {
-                                attrs[Str(row, "Name")] = row.GetValueOrDefault("Value");
-
-                                if (row.TryGetValue("Timestamp", out var t) && t is DateTime dt)
-                                {
-                                    ts = new DateTimeOffset(dt, TimeSpan.Zero);
-                                }
-                            }
-
-                            return new I3xValueResult(g.Key, ts, attrs);
+                            Row = r,
+                            Ts = r.TryGetValue("Timestamp", out var t) && t is DateTime dt ? dt : DateTime.MinValue
                         })
-                        .OrderByDescending(s => s.Timestamp)
+                        .OrderByDescending(x => x.Ts)
+                        .Select(x => new VQT(
+                            x.Row.GetValueOrDefault("Value"),
+                            "Good",
+                            x.Ts == DateTime.MinValue ? "" : ToRfc3339(x.Ts)))
                         .ToList();
 
-                    return new I3xHistoryResult(g.Key, samples);
-                })
-                .ToList();
+                    components[nameGroup.Key] = vqts;
+                }
 
-            return Ok(results);
+                var result = new HistoricalValueResult(
+                    true,
+                    Array.Empty<VQT>(),
+                    request.MaxDepth != 1 ? components : null);
+
+                return BulkResultItem<HistoricalValueResult>.Ok(id, result);
+            }).ToList();
+
+            return Ok(new BulkResponse<HistoricalValueResult>(true, items));
         }
 
-        /// <summary>
-        /// Fetches the latest telemetry attributes for a single object.
-        /// </summary>
-        private Dictionary<string, object> GetLatestAttributes(string dataSetWriterId)
+        private static ObjectInstanceResponse MapObject(Dictionary<string, object> r, bool includeMetadata)
         {
-            string query = "opcua_telemetry\r\n"
-                         + "| where DataSetWriterID == \"" + dataSetWriterId + "\"\r\n"
-                         + "| where Timestamp > now(- 1h)\r\n"
-                         + "| summarize arg_max(Timestamp, Value) by Name\r\n"
-                         + "| project Name, Value = todouble(Value)";
-
-            var rows = _kusto.RunQueryRows(query);
-
-            var attrs = new Dictionary<string, object>();
-            foreach (var row in rows)
-            {
-                attrs[Str(row, "Name")] = row.GetValueOrDefault("Value");
-            }
-
-            return attrs;
+            string parentId = Str(r, "NodeId");
+            return new ObjectInstanceResponse(
+                Str(r, "DataSetWriterID"),
+                Str(r, "DisplayName"),
+                Str(r, "Type"),
+                false,
+                string.IsNullOrEmpty(parentId) ? null : parentId,
+                false,
+                includeMetadata ? BuildMetadata(Str(r, "NamespaceUri"), Str(r, "Type")) : null);
         }
+
+        private static ObjectInstanceResponse MapRelatedObject(Dictionary<string, object> r, bool includeMetadata) =>
+            new(
+                Str(r, "ElementId"),
+                Str(r, "DisplayName"),
+                Str(r, "Type"),
+                false,
+                null,
+                false,
+                includeMetadata ? BuildMetadata(Str(r, "NamespaceUri"), Str(r, "Type")) : null);
+
+        private static ObjectInstanceMetadata BuildMetadata(string namespaceUri, string sourceTypeId) =>
+            new(TypeNamespaceUri: string.IsNullOrEmpty(namespaceUri) ? null : namespaceUri,
+                SourceTypeId: string.IsNullOrEmpty(sourceTypeId) ? null : sourceTypeId);
+
+        private static string ToRfc3339(DateTime dt) =>
+            new DateTimeOffset(dt, TimeSpan.Zero).ToString("o");
 
         private static string Str(Dictionary<string, object> row, string key) =>
             row.TryGetValue(key, out var v) ? v?.ToString() ?? "" : "";

@@ -5,7 +5,7 @@ using System.Linq;
 namespace I3X4Kusto.Controllers
 {
     [ApiController]
-    [Route("v0/objecttypes")]
+    [Route("v1/objecttypes")]
     public sealed class ObjectTypesController : ControllerBase
     {
         private readonly ADXDataService _kusto;
@@ -17,28 +17,28 @@ namespace I3X4Kusto.Controllers
         }
 
         [HttpGet]
-        public ActionResult<IEnumerable<I3xObjectType>> GetObjectTypes()
+        public ActionResult<SuccessResponse<IReadOnlyList<ObjectTypeResponse>>> GetObjectTypes(
+            [FromQuery] string namespaceUri = null)
         {
-            string query = "opcua_metadata_lkv\r\n"
-                         + "| distinct Type, NamespaceUri\r\n"
-                         + "| project Type, NamespaceUri";
+            string query = "opcua_metadata_lkv\r\n";
+            if (!string.IsNullOrEmpty(namespaceUri))
+            {
+                query += "| where NamespaceUri in (" + ADXDataService.ToKqlStringList([namespaceUri]) + ")\r\n";
+            }
+            query += "| distinct Type, NamespaceUri\r\n"
+                   + "| project Type, NamespaceUri";
 
             var rows = _kusto.RunQueryRows(query);
 
-            var results = rows.Select(r => new I3xObjectType(
-                Str(r, "Type"),
-                Str(r, "Type"),
-                Str(r, "NamespaceUri"),
-                new Dictionary<string, object>()
-            )).ToList();
+            var results = rows.Select(MapObjectType).ToList();
 
-            return Ok(results);
+            return Ok(new SuccessResponse<IReadOnlyList<ObjectTypeResponse>>(true, results));
         }
 
         [HttpPost("query")]
-        public ActionResult<IEnumerable<I3xObjectType>> QueryByElementId([FromBody] ElementIdQuery query)
+        public ActionResult<BulkResponse<ObjectTypeResponse>> QueryByElementId([FromBody] GetObjectTypesRequest request)
         {
-            string inClause = ADXDataService.ToKqlStringList(query.ElementIds);
+            string inClause = ADXDataService.ToKqlStringList(request.ElementIds);
 
             string kql = "opcua_metadata_lkv\r\n"
                        + "| where Type in (" + inClause + ")\r\n"
@@ -47,14 +47,26 @@ namespace I3X4Kusto.Controllers
 
             var rows = _kusto.RunQueryRows(kql);
 
-            var results = rows.Select(r => new I3xObjectType(
-                Str(r, "Type"),
-                Str(r, "Type"),
-                Str(r, "NamespaceUri"),
-                new Dictionary<string, object>()
-            )).ToList();
+            var byId = rows
+                .GroupBy(r => Str(r, "Type"))
+                .ToDictionary(g => g.Key, g => MapObjectType(g.First()));
 
-            return Ok(results);
+            var items = request.ElementIds.Select(id => byId.TryGetValue(id, out var ot)
+                ? BulkResultItem<ObjectTypeResponse>.Ok(id, ot)
+                : BulkResultItem<ObjectTypeResponse>.NotFound(id, "Object type not found")).ToList();
+
+            return Ok(new BulkResponse<ObjectTypeResponse>(true, items));
+        }
+
+        private static ObjectTypeResponse MapObjectType(Dictionary<string, object> r)
+        {
+            var type = Str(r, "Type");
+            return new ObjectTypeResponse(
+                type,
+                type,
+                Str(r, "NamespaceUri"),
+                type,
+                new Dictionary<string, object>());
         }
 
         private static string Str(Dictionary<string, object> row, string key) =>
