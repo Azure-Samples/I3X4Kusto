@@ -72,31 +72,47 @@ namespace I3xKustoAdapter.Controllers
             string inClause = ADXDataService.ToKqlStringList(request.ElementIds);
             string sourceRelationship = string.IsNullOrEmpty(request.RelationshipType) ? "HasComponent" : request.RelationshipType;
 
-            // Find sibling variables that share an Object (DataSetWriterID) with each requested element.
+            // Determine which requested Objects (by DataSetWriterID) actually exist,
+            // so unknown elementIds can be reported as NotFound.
+            string existsQuery = "opcua_metadata_lkv\r\n"
+                               + "| where DataSetWriterID in (" + inClause + ")\r\n"
+                               + "| distinct DataSetWriterID";
+
+            var existing = new HashSet<string>(
+                _kusto.RunQueryRows(existsQuery).Select(r => Str(r, "DataSetWriterID")));
+
+            // Related Objects are siblings: other Objects that share the same parent (NodeId).
             string query = "opcua_metadata_lkv\r\n"
-                         + "| where Name in (" + inClause + ")\r\n"
-                         + "| distinct DataSetWriterID, SourceName = Name\r\n"
+                         + "| where DataSetWriterID in (" + inClause + ")\r\n"
+                         + "| where isnotempty(NodeId)\r\n"
+                         + "| distinct SourceId = DataSetWriterID, NodeId\r\n"
                          + "| join kind=inner (\r\n"
                          + "    opcua_metadata_lkv\r\n"
-                         + "    | distinct DataSetWriterID, Name, Type, NamespaceUri\r\n"
-                         + ") on DataSetWriterID\r\n"
-                         + "| where Name != SourceName\r\n"
-                         + "| project SourceName, ElementId = DataSetWriterID, DisplayName = Name, Type, NamespaceUri";
+                         + "    | distinct DataSetWriterID, NodeId, DisplayName, Type, NamespaceUri\r\n"
+                         + ") on NodeId\r\n"
+                         + "| where DataSetWriterID != SourceId\r\n"
+                         + "| project SourceId, NodeId, DisplayName, Type, DataSetWriterID, NamespaceUri";
 
             var rows = _kusto.RunQueryRows(query);
 
             var bySource = rows
-                .GroupBy(r => Str(r, "SourceName"))
+                .GroupBy(r => Str(r, "SourceId"))
                 .ToDictionary(
                     g => g.Key,
                     g => g.Select(r => new RelatedObjectResult(
                         sourceRelationship,
-                        MapRelatedObject(r, request.IncludeMetadata))).ToList());
+                        MapObject(r, request.IncludeMetadata))).ToList());
 
             var items = request.ElementIds.Select(id =>
-                BulkResultItem<List<RelatedObjectResult>>.Ok(
-                    id,
-                    bySource.TryGetValue(id, out var related) ? related : new List<RelatedObjectResult>())).ToList();
+            {
+                if (!existing.Contains(id))
+                {
+                    return BulkResultItem<List<RelatedObjectResult>>.NotFound(id, "Object not found");
+                }
+
+                var related = bySource.TryGetValue(id, out var rel) ? rel : new List<RelatedObjectResult>();
+                return BulkResultItem<List<RelatedObjectResult>>.Ok(id, related);
+            }).ToList();
 
             return Ok(new BulkResponse<List<RelatedObjectResult>>(true, items));
         }
@@ -220,16 +236,6 @@ namespace I3xKustoAdapter.Controllers
                 false,
                 includeMetadata ? BuildMetadata(Str(r, "NamespaceUri"), Str(r, "Type")) : null);
         }
-
-        private static ObjectInstanceResponse MapRelatedObject(Dictionary<string, object> r, bool includeMetadata) =>
-            new(
-                Str(r, "ElementId"),
-                Str(r, "DisplayName"),
-                Str(r, "Type"),
-                false,
-                null,
-                false,
-                includeMetadata ? BuildMetadata(Str(r, "NamespaceUri"), Str(r, "Type")) : null);
 
         private static ObjectInstanceMetadata BuildMetadata(string namespaceUri, string sourceTypeId) =>
             new(TypeNamespaceUri: string.IsNullOrEmpty(namespaceUri) ? null : namespaceUri,
