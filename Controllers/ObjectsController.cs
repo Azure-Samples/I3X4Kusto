@@ -35,7 +35,7 @@ namespace I3xKustoAdapter.Controllers
                 // Root Objects are those without a parent node.
                 query += "| where isempty(NodeId)\r\n";
             }
-            query += "| project NodeId, DisplayName, Type, DataSetWriterID, NamespaceUri";
+            query += "| project NodeId, DisplayName, Type, DataSetWriterID = Subject, NamespaceUri";
 
             var rows = _kusto.RunQueryRows(query);
 
@@ -50,8 +50,8 @@ namespace I3xKustoAdapter.Controllers
             string inClause = ADXDataService.ToKqlStringList(request.ElementIds);
 
             string query = "opcua_metadata_lkv\r\n"
-                         + "| where DataSetWriterID in (" + inClause + ")\r\n"
-                         + "| project NodeId, DisplayName, Type, DataSetWriterID, NamespaceUri";
+                         + "| where Subject in (" + inClause + ")\r\n"
+                         + "| project NodeId, DisplayName, Type, DataSetWriterID = Subject, NamespaceUri";
 
             var rows = _kusto.RunQueryRows(query);
 
@@ -75,23 +75,23 @@ namespace I3xKustoAdapter.Controllers
             // Determine which requested Objects (by DataSetWriterID) actually exist,
             // so unknown elementIds can be reported as NotFound.
             string existsQuery = "opcua_metadata_lkv\r\n"
-                               + "| where DataSetWriterID in (" + inClause + ")\r\n"
-                               + "| distinct DataSetWriterID";
+                               + "| where Subject in (" + inClause + ")\r\n"
+                               + "| distinct DataSetWriterID = Subject";
 
             var existing = new HashSet<string>(
                 _kusto.RunQueryRows(existsQuery).Select(r => Str(r, "DataSetWriterID")));
 
             // Related Objects are siblings: other Objects that share the same parent (NodeId).
             string query = "opcua_metadata_lkv\r\n"
-                         + "| where DataSetWriterID in (" + inClause + ")\r\n"
+                         + "| where Subject in (" + inClause + ")\r\n"
                          + "| where isnotempty(NodeId)\r\n"
-                         + "| distinct SourceId = DataSetWriterID, NodeId\r\n"
+                         + "| distinct SourceId = Subject, NodeId\r\n"
                          + "| join kind=inner (\r\n"
                          + "    opcua_metadata_lkv\r\n"
-                         + "    | distinct DataSetWriterID, NodeId, DisplayName, Type, NamespaceUri\r\n"
+                         + "    | distinct Subject, NodeId, DisplayName, Type, NamespaceUri\r\n"
                          + ") on NodeId\r\n"
-                         + "| where DataSetWriterID != SourceId\r\n"
-                         + "| project SourceId, NodeId, DisplayName, Type, DataSetWriterID, NamespaceUri";
+                         + "| where Subject != SourceId\r\n"
+                         + "| project SourceId, NodeId, DisplayName, Type, DataSetWriterID = Subject, NamespaceUri";
 
             var rows = _kusto.RunQueryRows(query);
 
@@ -123,10 +123,10 @@ namespace I3xKustoAdapter.Controllers
             string inClause = ADXDataService.ToKqlStringList(request.ElementIds);
 
             string query = "opcua_telemetry\r\n"
-                         + "| where DataSetWriterID in (" + inClause + ")\r\n"
+                         + "| where Subject in (" + inClause + ")\r\n"
                          + "| where Timestamp > now(- 1h)\r\n"
-                         + "| summarize arg_max(Timestamp, Value) by DataSetWriterID, Name\r\n"
-                         + "| project DataSetWriterID, Name, Timestamp, Value = todouble(Value)\r\n"
+                         + "| summarize arg_max(Timestamp, Value) by Subject, Name\r\n"
+                         + "| project DataSetWriterID = Subject, Name, Timestamp, Value = todouble(Value)\r\n"
                          + "| sort by DataSetWriterID asc, Timestamp desc";
 
             var rows = _kusto.RunQueryRows(query);
@@ -177,9 +177,9 @@ namespace I3xKustoAdapter.Controllers
             string end = request.EndTime ?? DateTime.UtcNow.ToString("o");
 
             string query = "opcua_telemetry\r\n"
-                         + "| where DataSetWriterID in (" + inClause + ")\r\n"
+                         + "| where Subject in (" + inClause + ")\r\n"
                          + "| where Timestamp between (datetime(\"" + start + "\") .. datetime(\"" + end + "\"))\r\n"
-                         + "| project DataSetWriterID, Name, Timestamp, Value = todouble(Value)\r\n"
+                         + "| project DataSetWriterID = Subject, Name, Timestamp, Value = todouble(Value)\r\n"
                          + "| sort by DataSetWriterID asc, Timestamp desc";
 
             var rows = _kusto.RunQueryRows(query);
