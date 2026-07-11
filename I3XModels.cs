@@ -186,4 +186,75 @@
         [property: JsonPropertyName("startTime")] string StartTime = null,
         [property: JsonPropertyName("endTime")] string EndTime = null,
         [property: JsonPropertyName("maxDepth")] int MaxDepth = 1);
+
+    // ---------------------------------------------------------------------
+    // Subscription models (match the i3X 1.0 spec)
+    // ---------------------------------------------------------------------
+
+    /// <summary>Request for POST /subscriptions.</summary>
+    public sealed record CreateSubscriptionRequest(
+        [property: JsonPropertyName("clientId")] string ClientId,
+        [property: JsonPropertyName("displayName")] string DisplayName = null);
+
+    /// <summary>Response for POST /subscriptions.</summary>
+    public sealed record CreateSubscriptionResponse(
+        [property: JsonPropertyName("clientId")] string ClientId,
+        [property: JsonPropertyName("subscriptionId")] string SubscriptionId,
+        [property: JsonPropertyName("displayName")]
+        [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        string DisplayName = null);
+
+    /// <summary>Request for POST /subscriptions/register.</summary>
+    public sealed record RegisterMonitoredItemsRequest(
+        [property: JsonPropertyName("clientId")] string ClientId,
+        [property: JsonPropertyName("subscriptionId")] string SubscriptionId,
+        [property: JsonPropertyName("elementIds")] string[] ElementIds,
+        [property: JsonPropertyName("maxDepth")] int? MaxDepth = 1);
+
+    /// <summary>Request for POST /subscriptions/unregister.</summary>
+    public sealed record UnregisterMonitoredItemsRequest(
+        [property: JsonPropertyName("clientId")] string ClientId,
+        [property: JsonPropertyName("subscriptionId")] string SubscriptionId,
+        [property: JsonPropertyName("elementIds")] string[] ElementIds);
+
+    /// <summary>Request for POST /subscriptions/list.</summary>
+    public sealed record ListSubscriptionsRequest(
+        [property: JsonPropertyName("clientId")] string ClientId,
+        [property: JsonPropertyName("subscriptionIds")] string[] SubscriptionIds);
+
+    /// <summary>Request for POST /subscriptions/delete.</summary>
+    public sealed record DeleteSubscriptionsRequest(
+        [property: JsonPropertyName("clientId")] string ClientId,
+        [property: JsonPropertyName("subscriptionIds")] string[] SubscriptionIds);
+
+    /// <summary>A subscription with its currently monitored objects (POST /subscriptions/list result).</summary>
+    public sealed record SubscriptionDetail(
+        [property: JsonPropertyName("subscriptionId")] string SubscriptionId,
+        [property: JsonPropertyName("monitoredObjects")] IReadOnlyList<Dictionary<string, object>> MonitoredObjects,
+        [property: JsonPropertyName("displayName")]
+        [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        string DisplayName = null);
+
+    /// <summary>Request for POST /subscriptions/sync.</summary>
+    public sealed record SyncRequest(
+        [property: JsonPropertyName("clientId")] string ClientId,
+        [property: JsonPropertyName("subscriptionId")] string SubscriptionId,
+        [property: JsonPropertyName("lastSequenceNumber")] long? LastSequenceNumber = null);
+
+    /// <summary>A single value update in a sync batch.</summary>
+    public sealed record SyncUpdateEntry(
+        [property: JsonPropertyName("elementId")] string ElementId,
+        [property: JsonPropertyName("value")] object Value,
+        [property: JsonPropertyName("quality")] string Quality,
+        [property: JsonPropertyName("timestamp")] string Timestamp);
+
+    /// <summary>A batch of value updates with a monotonic sequence number.</summary>
+    public sealed record SyncBatch(
+        [property: JsonPropertyName("sequenceNumber")] long SequenceNumber,
+        [property: JsonPropertyName("updates")] IReadOnlyList<SyncUpdateEntry> Updates);
+
+    /// <summary>Request for POST /subscriptions/stream.</summary>
+    public sealed record StreamRequest(
+        [property: JsonPropertyName("clientId")] string ClientId,
+        [property: JsonPropertyName("subscriptionId")] string SubscriptionId);
 }

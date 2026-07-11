@@ -70,7 +70,12 @@ namespace I3xKustoAdapter.Controllers
         public ActionResult<BulkResponse<List<RelatedObjectResult>>> QueryRelatedObjects([FromBody] GetRelatedObjectsRequest request)
         {
             string inClause = ADXDataService.ToKqlStringList(request.ElementIds);
-            string sourceRelationship = string.IsNullOrEmpty(request.RelationshipType) ? "HasComponent" : request.RelationshipType;
+
+            // Resolve the requested relationship type (default HasComponent). i3X relationships are
+            // directional: a "forward" type (e.g. HasComponent, Organizes) walks from a parent to its
+            // children, and its reverse (e.g. ComponentOf, OrganizedBy) walks from a child to its parent.
+            string requestedType = string.IsNullOrEmpty(request.RelationshipType) ? "HasComponent" : request.RelationshipType;
+            RelationshipDirection direction = ResolveDirection(requestedType);
 
             // Determine which requested Objects (by DataSetWriterID) actually exist,
             // so unknown elementIds can be reported as NotFound.
@@ -81,27 +86,10 @@ namespace I3xKustoAdapter.Controllers
             var existing = new HashSet<string>(
                 _kusto.RunQueryRows(existsQuery).Select(r => Str(r, "DataSetWriterID")));
 
-            // Related Objects are siblings: other Objects that share the same parent (NodeId).
-            string query = "opcua_metadata_lkv\r\n"
-                         + "| where Subject in (" + inClause + ")\r\n"
-                         + "| where isnotempty(NodeId)\r\n"
-                         + "| distinct SourceId = Subject, NodeId\r\n"
-                         + "| join kind=inner (\r\n"
-                         + "    opcua_metadata_lkv\r\n"
-                         + "    | distinct Subject, NodeId, DisplayName, Type, NamespaceUri\r\n"
-                         + ") on NodeId\r\n"
-                         + "| where Subject != SourceId\r\n"
-                         + "| project SourceId, NodeId, DisplayName, Type, DataSetWriterID = Subject, NamespaceUri";
-
-            var rows = _kusto.RunQueryRows(query);
-
-            var bySource = rows
-                .GroupBy(r => Str(r, "SourceId"))
-                .ToDictionary(
-                    g => g.Key,
-                    g => g.Select(r => new RelatedObjectResult(
-                        sourceRelationship,
-                        MapObject(r, request.IncludeMetadata))).ToList());
+            // An unknown/unsupported relationship type yields no related objects (rather than mislabeling).
+            var bySource = direction == RelationshipDirection.Unsupported
+                ? new Dictionary<string, List<RelatedObjectResult>>()
+                : QueryRelatedByIsa95(inClause, requestedType, direction, request.IncludeMetadata);
 
             var items = request.ElementIds.Select(id =>
             {
@@ -115,6 +103,115 @@ namespace I3xKustoAdapter.Controllers
             }).ToList();
 
             return Ok(new BulkResponse<List<RelatedObjectResult>>(true, items));
+        }
+
+        /// <summary>
+        /// Walks the ISA-95 containment hierarchy (Enterprise &gt; Site &gt; Area &gt; Line &gt; Workcell)
+        /// carried in the OPC UA metadata. Forward (HasComponent/Organizes) returns the direct children
+        /// of each source object; reverse (ComponentOf/OrganizedBy) returns the direct parent. Falls back
+        /// to NodeId-sibling grouping when the ISA-95 levels are not populated.
+        /// </summary>
+        private Dictionary<string, List<RelatedObjectResult>> QueryRelatedByIsa95(
+            string inClause, string sourceRelationship, RelationshipDirection direction, bool includeMetadata)
+        {
+            // Bring back the source objects with their full ISA-95 path, then all candidate objects, and
+            // relate them by direct containment (parent/child differ by exactly one populated level).
+            string query = "let sources = opcua_metadata_lkv\r\n"
+                         + "| where Subject in (" + inClause + ")\r\n"
+                         + "| distinct SourceId = Subject, Workcell, Line, Area, Site, Enterprise, NodeId;\r\n"
+                         + "let candidates = opcua_metadata_lkv\r\n"
+                         + "| distinct Subject, NodeId, DisplayName, Type, NamespaceUri, Workcell, Line, Area, Site, Enterprise;\r\n"
+                         + "sources\r\n"
+                         + "| extend srcDepth = tolong(isnotempty(Enterprise)) + tolong(isnotempty(Site)) + tolong(isnotempty(Area)) + tolong(isnotempty(Line)) + tolong(isnotempty(Workcell))\r\n"
+                         + "| join kind=inner (\r\n"
+                         + "    candidates\r\n"
+                         + "    | extend candDepth = tolong(isnotempty(Enterprise)) + tolong(isnotempty(Site)) + tolong(isnotempty(Area)) + tolong(isnotempty(Line)) + tolong(isnotempty(Workcell))\r\n"
+                         + ") on Enterprise\r\n"
+                         + "| where Subject != SourceId\r\n"
+                         // Same higher-level ancestry, differing by exactly one containment level.
+                         + "| where (Site == Site1) and (Area == Area1) and (Line == Line1)\r\n";
+
+            // Direction selects whether we return the deeper (child) or shallower (parent) neighbor.
+            query += direction == RelationshipDirection.Reverse
+                ? "| where candDepth == srcDepth - 1\r\n"
+                : "| where candDepth == srcDepth + 1\r\n";
+
+            query += "| project SourceId, DataSetWriterID = Subject, NodeId = NodeId1, DisplayName = DisplayName1, Type = Type1, NamespaceUri = NamespaceUri1";
+
+            List<Dictionary<string, object>> rows;
+            try
+            {
+                rows = _kusto.RunQueryRows(query);
+            }
+            catch
+            {
+                rows = new List<Dictionary<string, object>>();
+            }
+
+            // Fallback: if ISA-95 levels are not populated, group by shared parent NodeId (siblings).
+            if (rows.Count == 0)
+            {
+                rows = QueryRelatedBySiblingNodeId(inClause);
+            }
+
+            return rows
+                .GroupBy(r => Str(r, "SourceId"))
+                .ToDictionary(
+                    g => g.Key,
+                    g => g.Select(r => new RelatedObjectResult(
+                        sourceRelationship,
+                        MapObject(r, includeMetadata))).ToList());
+        }
+
+        /// <summary>Legacy behavior: related objects are siblings sharing the same parent NodeId.</summary>
+        private List<Dictionary<string, object>> QueryRelatedBySiblingNodeId(string inClause)
+        {
+            string query = "opcua_metadata_lkv\r\n"
+                         + "| where Subject in (" + inClause + ")\r\n"
+                         + "| where isnotempty(NodeId)\r\n"
+                         + "| distinct SourceId = Subject, NodeId\r\n"
+                         + "| join kind=inner (\r\n"
+                         + "    opcua_metadata_lkv\r\n"
+                         + "    | distinct Subject, NodeId, DisplayName, Type, NamespaceUri\r\n"
+                         + ") on NodeId\r\n"
+                         + "| where Subject != SourceId\r\n"
+                         + "| project SourceId, NodeId, DisplayName, Type, DataSetWriterID = Subject, NamespaceUri";
+
+            return _kusto.RunQueryRows(query);
+        }
+
+        /// <summary>Direction of an i3X relationship relative to the ISA-95 containment hierarchy.</summary>
+        private enum RelationshipDirection
+        {
+            Forward,     // parent -> children (HasComponent, Organizes, ...)
+            Reverse,     // child -> parent   (ComponentOf, OrganizedBy, ...)
+            Unsupported
+        }
+
+        // Forward containment relationship types and their reverses, matching RelationshipTypesController.
+        private static readonly HashSet<string> ForwardContainmentTypes = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "HasComponent", "HasOrderedComponent", "Organizes", "HasProperty"
+        };
+
+        private static readonly HashSet<string> ReverseContainmentTypes = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "ComponentOf", "OrderedComponentOf", "OrganizedBy", "PropertyOf"
+        };
+
+        private static RelationshipDirection ResolveDirection(string relationshipType)
+        {
+            if (ForwardContainmentTypes.Contains(relationshipType))
+            {
+                return RelationshipDirection.Forward;
+            }
+
+            if (ReverseContainmentTypes.Contains(relationshipType))
+            {
+                return RelationshipDirection.Reverse;
+            }
+
+            return RelationshipDirection.Unsupported;
         }
 
         [HttpPost("value")]
