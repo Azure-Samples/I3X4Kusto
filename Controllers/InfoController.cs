@@ -16,7 +16,7 @@ namespace I3X4Kusto.Controllers
                 Capabilities: new ServerCapabilities(
                     new QueryCapabilities(History: true),
                     new UpdateCapabilities(Current: false, History: false),
-                    new SubscribeCapabilities(Stream: false)),
+                    new SubscribeCapabilities(Stream: true)),
                 ServerVersion: "1.0.0",
                 ServerName: "I3X4Kusto");
 
