@@ -24,7 +24,8 @@ namespace I3xKustoAdapter.Controllers
             [FromQuery] bool includeMetadata = false,
             [FromQuery] bool? root = null)
         {
-            string query = "opcua_metadata_lkv\r\n";
+            string query = ADXDataService.NamespaceBySubjectPrelude
+                         + "opcua_metadata_lkv\r\n";
             if (!string.IsNullOrEmpty(typeElementId))
             {
                 // Objects whose telemetry includes the given variable type
@@ -35,7 +36,8 @@ namespace I3xKustoAdapter.Controllers
                 // Root Objects are those without a parent node.
                 query += "| where isempty(NodeId)\r\n";
             }
-            query += "| project NodeId, DisplayName, Type, DataSetWriterID = Subject, NamespaceUri";
+            query += ADXDataService.ResolveNamespaceUri() + "\r\n"
+                   + "| project NodeId, DisplayName, Type, DataSetWriterID = Subject, NamespaceUri";
 
             var rows = _kusto.RunQueryRows(query);
 
@@ -49,8 +51,10 @@ namespace I3xKustoAdapter.Controllers
         {
             string inClause = ADXDataService.ToKqlStringList(request.ElementIds);
 
-            string query = "opcua_metadata_lkv\r\n"
+            string query = ADXDataService.NamespaceBySubjectPrelude
+                         + "opcua_metadata_lkv\r\n"
                          + "| where Subject in (" + inClause + ")\r\n"
+                         + ADXDataService.ResolveNamespaceUri() + "\r\n"
                          + "| project NodeId, DisplayName, Type, DataSetWriterID = Subject, NamespaceUri";
 
             var rows = _kusto.RunQueryRows(query);
@@ -166,7 +170,8 @@ namespace I3xKustoAdapter.Controllers
         /// <summary>Legacy behavior: related objects are siblings sharing the same parent NodeId.</summary>
         private List<Dictionary<string, object>> QueryRelatedBySiblingNodeId(string inClause)
         {
-            string query = "opcua_metadata_lkv\r\n"
+            string query = ADXDataService.NamespaceBySubjectPrelude
+                         + "opcua_metadata_lkv\r\n"
                          + "| where Subject in (" + inClause + ")\r\n"
                          + "| where isnotempty(NodeId)\r\n"
                          + "| distinct SourceId = Subject, NodeId\r\n"
@@ -175,6 +180,7 @@ namespace I3xKustoAdapter.Controllers
                          + "    | distinct Subject, NodeId, DisplayName, Type, NamespaceUri\r\n"
                          + ") on NodeId\r\n"
                          + "| where Subject != SourceId\r\n"
+                         + ADXDataService.ResolveNamespaceUri() + "\r\n"
                          + "| project SourceId, NodeId, DisplayName, Type, DataSetWriterID = Subject, NamespaceUri";
 
             return _kusto.RunQueryRows(query);

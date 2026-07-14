@@ -20,7 +20,9 @@ namespace I3X4Kusto.Controllers
         public ActionResult<SuccessResponse<IReadOnlyList<ObjectTypeResponse>>> GetObjectTypes(
             [FromQuery] string namespaceUri = null)
         {
-            string query = "opcua_metadata_lkv\r\n";
+            string query = ADXDataService.NamespaceBySubjectPrelude
+                         + "opcua_metadata_lkv\r\n"
+                         + ADXDataService.ResolveNamespaceUri() + "\r\n";
             if (!string.IsNullOrEmpty(namespaceUri))
             {
                 query += "| where NamespaceUri in (" + ADXDataService.ToKqlStringList([namespaceUri]) + ")\r\n";
@@ -40,8 +42,10 @@ namespace I3X4Kusto.Controllers
         {
             string inClause = ADXDataService.ToKqlStringList(request.ElementIds);
 
-            string kql = "opcua_metadata_lkv\r\n"
+            string kql = ADXDataService.NamespaceBySubjectPrelude
+                       + "opcua_metadata_lkv\r\n"
                        + "| where Type in (" + inClause + ")\r\n"
+                       + ADXDataService.ResolveNamespaceUri() + "\r\n"
                        + "| distinct Type, NamespaceUri\r\n"
                        + "| project Type, NamespaceUri";
 

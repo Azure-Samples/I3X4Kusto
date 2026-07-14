@@ -19,15 +19,20 @@ namespace I3X4Kusto.Controllers
         [HttpGet]
         public ActionResult<SuccessResponse<IReadOnlyList<Namespace>>> GetNamespaces()
         {
-            string query = "opcua_metadata_lkv\r\n"
+            string query = ADXDataService.NamespaceBySubjectPrelude
+                         + "NamespaceBySubject\r\n"
+                         + "| where isnotempty(NamespaceUri)\r\n"
                          + "| distinct NamespaceUri";
 
             var rows = _kusto.RunQueryRows(query);
 
-            var results = rows.Select(r => new Namespace(
-                Str(r, "NamespaceUri"),
-                ExtractNameFromUri(Str(r, "NamespaceUri"))
-            )).ToList();
+            var results = rows
+                .Select(r => Str(r, "NamespaceUri"))
+                .Where(uri => !string.IsNullOrEmpty(uri))
+                .Distinct()
+                .OrderBy(uri => uri, System.StringComparer.Ordinal)
+                .Select(uri => new Namespace(uri, ExtractNameFromUri(uri)))
+                .ToList();
 
             return Ok(new SuccessResponse<IReadOnlyList<Namespace>>(true, results));
         }
