@@ -60,7 +60,7 @@ namespace I3xKustoAdapter.Controllers
                 true,
                 node.ParentId,
                 false,
-                includeMetadata ? BuildMetadata(node.IsAsset ? node.NamespaceUri : null, typeId) : null);
+                includeMetadata ? BuildMetadata(node.NamespaceUri, typeId) : null);
         }
 
         [HttpGet]

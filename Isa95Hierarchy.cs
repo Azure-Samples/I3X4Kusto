@@ -28,6 +28,13 @@ namespace I3X4Kusto
         /// <summary>Prefix that distinguishes synthetic container ElementIds from asset/variable ids.</summary>
         public const string ContainerIdPrefix = "isa95:";
 
+        /// <summary>
+        /// Namespace URI for the synthetic ISA-95 structural container levels (Enterprise/Site/Area/Line/
+        /// Workcell). The I3X specification requires every level to carry a namespaceUri, so intermediate
+        /// container nodes (which are not backed by an OPC UA node of their own) are qualified with this URI.
+        /// </summary>
+        public const string Isa95NamespaceUri = "urn:opcfoundation:ua:isa95";
+
         /// <summary>Separator between an asset Subject and a variable Name in a variable leaf ElementId.</summary>
         public const string VariableIdSeparator = "::";
 
@@ -66,6 +73,7 @@ namespace I3X4Kusto
                             DisplayName = value,
                             Level = level,
                             Kind = NodeKind.Container,
+                            NamespaceUri = Isa95NamespaceUri,
                             ParentId = parent?.ElementId
                         };
                         _byId[containerId] = node;
@@ -113,7 +121,11 @@ namespace I3X4Kusto
             if (container.Subject == null)
             {
                 container.Subject = Str(row, "Subject");
-                container.NamespaceUri = Str(row, "NamespaceUri");
+                string assetNamespace = Str(row, "NamespaceUri");
+                if (!string.IsNullOrEmpty(assetNamespace))
+                {
+                    container.NamespaceUri = assetNamespace;
+                }
             }
             return container;
         }
@@ -136,7 +148,9 @@ namespace I3X4Kusto
                     Kind = NodeKind.Container,
                     Level = "Asset",
                     Subject = subject,
-                    NamespaceUri = Str(row, "NamespaceUri")
+                    NamespaceUri = string.IsNullOrEmpty(Str(row, "NamespaceUri"))
+                        ? Isa95NamespaceUri
+                        : Str(row, "NamespaceUri")
                 };
 
                 _byId[subject] = asset;
