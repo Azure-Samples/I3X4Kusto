@@ -14,6 +14,7 @@ This adapter implements the read/query and subscription surface of the [i3X 1.0 
 * "ADX_DB": Azure Data Explorer or Fabric Event House database name
 * "ADX_APPLICATION_ID": Azure Entra ID application/client ID (only required when hosting I3X4Kusto on Azure)
 * "AZURE_TENANT_ID": Azure Entra ID tenant ID
+* "I3X_BASIC_AUTH_USERNAME" / "I3X_BASIC_AUTH_PASSWORD": HTTP Basic authentication credentials. Authentication is mandatory: every request must present a matching `Authorization: Basic` header. The unauthenticated health/capabilities endpoint (`GET /v1/info`), the Swagger UI / OpenAPI documents, and CORS preflight (`OPTIONS`) requests remain open. If these variables are not set, the API fails closed and returns HTTP 503.
 
 ## Optional Environment Variables
 * "I3X_CORS_ORIGINS": comma-separated list of allowed CORS origins. When unset, all origins are allowed (required so the browser-based CESMII i3X client can call the API cross-origin). Set this to lock CORS down to specific origins in production.

@@ -1,7 +1,9 @@
 using Microsoft.AspNetCore.Builder;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.OpenApi;
 using System;
+using System.Collections.Generic;
 
 namespace I3X4Kusto
 {
@@ -17,7 +19,25 @@ namespace I3X4Kusto
 
             builder.Services.AddOpenApi();
 
-            builder.Services.AddSwaggerGen();
+            builder.Services.AddSwaggerGen(options =>
+            {
+                // Enable HTTP Basic auth in the Swagger UI so the "Authorize" button lets users
+                // supply credentials that are sent as the "Authorization: Basic" header on API calls.
+                options.AddSecurityDefinition("basic", new OpenApiSecurityScheme
+                {
+                    Type = SecuritySchemeType.Http,
+                    Scheme = "basic",
+                    Description = "Enter the I3X_BASIC_AUTH_USERNAME and I3X_BASIC_AUTH_PASSWORD credentials."
+                });
+
+                options.AddSecurityRequirement(document => new OpenApiSecurityRequirement
+                {
+                    {
+                        new OpenApiSecuritySchemeReference("basic", document),
+                        new List<string>()
+                    }
+                });
+            });
 
             builder.Services.AddSingleton<ADXDataService>();
 
@@ -67,6 +87,10 @@ namespace I3X4Kusto
 
             // CORS must run before the endpoints so preflight requests are handled.
             app.UseCors(CorsPolicyName);
+
+            // HTTP Basic authentication
+            // Runs after CORS so preflight OPTIONS requests are not challenged.
+            app.UseMiddleware<BasicAuthMiddleware>();
 
             app.MapControllers();
 
