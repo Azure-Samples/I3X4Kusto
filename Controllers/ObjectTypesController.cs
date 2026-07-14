@@ -20,40 +20,37 @@ namespace I3X4Kusto.Controllers
         public ActionResult<SuccessResponse<IReadOnlyList<ObjectTypeResponse>>> GetObjectTypes(
             [FromQuery] string namespaceUri = null)
         {
-            string query = ADXDataService.NamespaceBySubjectPrelude
-                         + "opcua_metadata_lkv\r\n"
-                         + ADXDataService.ResolveNamespaceUri() + "\r\n";
-            if (!string.IsNullOrEmpty(namespaceUri))
-            {
-                query += "| where NamespaceUri in (" + ADXDataService.ToKqlStringList([namespaceUri]) + ")\r\n";
-            }
-            query += "| distinct Type, NamespaceUri\r\n"
-                   + "| project Type, NamespaceUri";
+            // Build the object types from the same variable data (and TypeToken logic) the objects use, so the
+            // type ids returned here always match each object's typeElementId. A type is a distinct OPC UA
+            // DataType within a Namespace; its elementId is namespace-qualified to stay globally unique.
+            var hierarchy = new Isa95Hierarchy(_kusto.GetIsa95LeafAssets());
 
-            var rows = _kusto.RunQueryRows(query);
+            var types = hierarchy.ById.Values
+                .Where(n => n.Kind == Isa95Hierarchy.NodeKind.Variable &&
+                            (string.IsNullOrEmpty(namespaceUri) ||
+                             string.Equals(n.NamespaceUri, namespaceUri, System.StringComparison.Ordinal)))
+                .Select(n => (n.NamespaceUri, Token: n.TypeToken))
+                .Distinct()
+                .Select(t => MapObjectType(t.NamespaceUri, t.Token))
+                .ToList();
 
-            var results = rows.Select(MapObjectType).ToList();
-
-            return Ok(new SuccessResponse<IReadOnlyList<ObjectTypeResponse>>(true, results));
+            return Ok(new SuccessResponse<IReadOnlyList<ObjectTypeResponse>>(true, types));
         }
 
         [HttpPost("query")]
         public ActionResult<BulkResponse<ObjectTypeResponse>> QueryByElementId([FromBody] GetObjectTypesRequest request)
         {
-            string inClause = ADXDataService.ToKqlStringList(request.ElementIds);
+            // Type elementIds are namespace-qualified OPC UA DataTypes ("<namespaceUri>#<token>"). Resolve each
+            // by rebuilding the type set and matching on elementId.
+            var hierarchy = new Isa95Hierarchy(_kusto.GetIsa95LeafAssets());
 
-            string kql = ADXDataService.NamespaceBySubjectPrelude
-                       + "opcua_metadata_lkv\r\n"
-                       + "| where Type in (" + inClause + ")\r\n"
-                       + ADXDataService.ResolveNamespaceUri() + "\r\n"
-                       + "| distinct Type, NamespaceUri\r\n"
-                       + "| project Type, NamespaceUri";
-
-            var rows = _kusto.RunQueryRows(kql);
-
-            var byId = rows
-                .GroupBy(r => Str(r, "Type"))
-                .ToDictionary(g => g.Key, g => MapObjectType(g.First()));
+            var byId = hierarchy.ById.Values
+                .Where(n => n.Kind == Isa95Hierarchy.NodeKind.Variable)
+                .Select(n => (n.NamespaceUri, Token: n.TypeToken))
+                .Distinct()
+                .Select(t => MapObjectType(t.NamespaceUri, t.Token))
+                .GroupBy(t => t.ElementId)
+                .ToDictionary(g => g.Key, g => g.First());
 
             var items = request.ElementIds.Select(id => byId.TryGetValue(id, out var ot)
                 ? BulkResultItem<ObjectTypeResponse>.Ok(id, ot)
@@ -62,18 +59,15 @@ namespace I3X4Kusto.Controllers
             return Ok(new BulkResponse<ObjectTypeResponse>(true, items));
         }
 
-        private static ObjectTypeResponse MapObjectType(Dictionary<string, object> r)
+        private static ObjectTypeResponse MapObjectType(string namespaceUri, string token)
         {
-            var type = Str(r, "Type");
+            var elementId = ObjectTypeId.Build(namespaceUri, token);
             return new ObjectTypeResponse(
-                type,
-                type,
-                Str(r, "NamespaceUri"),
-                type,
+                elementId,
+                token,
+                namespaceUri,
+                token,
                 new Dictionary<string, object>());
         }
-
-        private static string Str(Dictionary<string, object> row, string key) =>
-            row.TryGetValue(key, out var v) ? v?.ToString() ?? "" : "";
     }
 }

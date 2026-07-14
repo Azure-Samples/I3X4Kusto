@@ -140,5 +140,25 @@ namespace I3X4Kusto
 
             return rows;
         }
+
+        /// <summary>
+        /// Returns one row per OPC UA variable (Subject + Name) with its owning asset's ISA-95 path
+        /// (Enterprise/Site/Area/Line/Workcell), identity (Subject/DisplayName/Name), the generically resolved
+        /// NamespaceUri, and the OPC UA type information (DataType NodeId, BuiltInType and the field NodeId).
+        /// This is the raw input the ISA-95 hierarchy builder uses to synthesize the container tree, the
+        /// per-Subject asset object, and the per-variable leaf nodes with their proper OPC UA type ids.
+        /// </summary>
+        public List<Dictionary<string, object>> GetIsa95LeafAssets()
+        {
+            string query = NamespaceBySubjectPrelude
+                         + "opcua_metadata_lkv\r\n"
+                         + ResolveNamespaceUri() + "\r\n"
+                         + "| distinct Subject, Name, DisplayName, Type, DataType, BuiltInType, NodeId, "
+                         + "NamespaceUri, Enterprise, Site, Area, Line, Workcell\r\n"
+                         + "| project Subject, Name, DisplayName, Type, DataType, BuiltInType, NodeId, "
+                         + "NamespaceUri, Enterprise, Site, Area, Line, Workcell";
+
+            return RunQueryRows(query);
+        }
     }
 }
