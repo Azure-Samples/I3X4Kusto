@@ -4,7 +4,6 @@ using Microsoft.AspNetCore.Mvc;
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -246,41 +245,100 @@ namespace I3xKustoAdapter.Controllers
                 return true;
             }
 
-            string inClause = ADXDataService.ToKqlStringList(elements.ToArray());
+            // Registered element ids are I3X object ids (variable ids "<Subject>::<Name>" or asset Subjects).
+            // Resolve them through the ISA-95 hierarchy to the underlying telemetry Subjects, then map each
+            // telemetry (Subject, Name) reading back to the registered element id(s) that requested it.
+            var hierarchy = new Isa95Hierarchy(_kusto.GetIsa95LeafAssets());
+
+            var subjects = new HashSet<string>(StringComparer.Ordinal);
+            // (Subject, Name) -> variable element id, for variable registrations.
+            var variableByKey = new Dictionary<(string, string), string>();
+            // Subject -> asset element id, for asset registrations (deliver all of the asset's variables).
+            var assetBySubject = new Dictionary<string, string>(StringComparer.Ordinal);
+
+            foreach (var elementId in elements)
+            {
+                if (!hierarchy.TryGet(elementId, out var node) || string.IsNullOrEmpty(node.Subject))
+                {
+                    continue;
+                }
+
+                subjects.Add(node.Subject);
+                if (node.Kind == Isa95Hierarchy.NodeKind.Variable)
+                {
+                    variableByKey[(node.Subject, node.VariableName)] = elementId;
+                }
+                else if (node.IsAsset)
+                {
+                    assetBySubject[node.Subject] = elementId;
+                }
+            }
+
+            if (subjects.Count == 0)
+            {
+                return true;
+            }
+
+            string inClause = ADXDataService.ToKqlStringList(subjects.ToArray());
             string query = "opcua_telemetry\r\n"
                          + "| where Subject in (" + inClause + ")\r\n"
                          + "| where Timestamp > now(-1h)\r\n"
                          + "| summarize arg_max(Timestamp, Value) by Subject, Name\r\n"
-                         + "| project ElementId = Subject, Name, Timestamp, Value = todouble(Value)";
+                         + "| project Subject, Name, Timestamp, Value = tostring(Value)";
 
             var rows = _kusto.RunQueryRows(query);
 
             var updates = new List<SyncUpdateEntry>();
             foreach (var row in rows)
             {
-                string elementId = Str(row, "ElementId");
-                if (string.IsNullOrEmpty(elementId))
+                string subject = Str(row, "Subject");
+                string name = Str(row, "Name");
+                if (string.IsNullOrEmpty(subject))
                 {
                     continue;
                 }
 
                 DateTime ts = row.TryGetValue("Timestamp", out var t) && t is DateTime dt ? dt : DateTime.MinValue;
 
-                // Only deliver values strictly newer than what we've already sent for this element.
-                if (sub.LastSeen.TryGetValue(elementId, out var seen) && ts <= seen)
+                // A telemetry reading may satisfy a specific variable registration and/or an asset
+                // registration (which monitors all of its variables).
+                var targets = new List<string>(2);
+                if (variableByKey.TryGetValue((subject, name), out var variableId))
                 {
-                    continue;
+                    targets.Add(variableId);
+                }
+                if (assetBySubject.TryGetValue(subject, out var assetId))
+                {
+                    targets.Add(assetId);
                 }
 
-                updates.Add(new SyncUpdateEntry(
-                    elementId,
-                    row.GetValueOrDefault("Value"),
-                    "Good",
-                    ts == DateTime.MinValue ? string.Empty : ToRfc3339(ts)));
-
-                if (ts != DateTime.MinValue)
+                foreach (var elementId in targets)
                 {
-                    sub.LastSeen[elementId] = ts;
+                    bool isAssetTarget = assetBySubject.TryGetValue(subject, out var aId) && aId == elementId;
+
+                    // Variables track one high-water mark by their element id. Assets track one per contained
+                    // variable ("<assetId>::<name>"), falling back to the asset's base seed for the first poll.
+                    string markKey = isAssetTarget ? elementId + "::" + name : elementId;
+
+                    DateTime seen = DateTime.MinValue;
+                    bool hasSeen = sub.LastSeen.TryGetValue(markKey, out seen)
+                                   || (isAssetTarget && sub.LastSeen.TryGetValue(elementId, out seen));
+
+                    if (hasSeen && ts <= seen)
+                    {
+                        continue;
+                    }
+
+                    updates.Add(new SyncUpdateEntry(
+                        elementId,
+                        row.GetValueOrDefault("Value"),
+                        "Good",
+                        ts == DateTime.MinValue ? string.Empty : ToRfc3339(ts)));
+
+                    if (ts != DateTime.MinValue)
+                    {
+                        sub.LastSeen[markKey] = ts;
+                    }
                 }
             }
 

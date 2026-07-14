@@ -18,30 +18,86 @@ namespace I3xKustoAdapter.Controllers
             _kusto.Connect();
         }
 
+        /// <summary>Synthetic type id used for ISA-95 container objects that have no OPC UA type.</summary>
+        private const string ContainerTypePrefix = "ISA95:";
+
+        /// <summary>
+        /// Builds the ISA-95 containment tree from the current metadata. The tree synthesizes the
+        /// intermediate container levels (Enterprise/Site/Area/Line/Workcell) that are not materialized as
+        /// their own rows, and attaches each leaf asset under its deepest populated level.
+        /// </summary>
+        private Isa95Hierarchy BuildHierarchy() => new(_kusto.GetIsa95LeafAssets());
+
+        /// <summary>Maps an ISA-95 tree node (container/asset or variable) to an I3X object response.</summary>
+        private static ObjectInstanceResponse MapNode(Isa95Hierarchy.Node node, bool includeMetadata)
+        {
+            if (node.Kind == Isa95Hierarchy.NodeKind.Variable)
+            {
+                // Variable leaf: the value-bearing node. Its type is the OPC UA DataType from the metadata,
+                // namespace-qualified so it matches the ids returned by ObjectTypesController and stays unique
+                // across namespaces (enabling namespace -> type -> object navigation).
+                string typeToken = node.TypeToken;
+                string variableType = ObjectTypeId.Build(node.NamespaceUri, typeToken);
+                return new ObjectInstanceResponse(
+                    node.ElementId,
+                    node.DisplayName,
+                    variableType,
+                    false,
+                    node.ParentId,
+                    false,
+                    includeMetadata ? BuildMetadata(node.NamespaceUri, variableType) : null);
+            }
+
+            // Container level (ISA-95 level or the asset/station at the deepest level). These are structural
+            // ISA-95 nodes, not OPC UA objects, so they always get an ISA-95 type derived from their level
+            // (e.g. "ISA95:Site", "ISA95:Workcell"). Both are compositions.
+            string typeId = ContainerTypePrefix + node.Level;
+
+            return new ObjectInstanceResponse(
+                node.ElementId,
+                node.DisplayName,
+                typeId,
+                true,
+                node.ParentId,
+                false,
+                includeMetadata ? BuildMetadata(node.IsAsset ? node.NamespaceUri : null, typeId) : null);
+        }
+
         [HttpGet]
         public ActionResult<SuccessResponse<IReadOnlyList<ObjectInstanceResponse>>> GetObjects(
             [FromQuery] string typeElementId = null,
             [FromQuery] bool includeMetadata = false,
             [FromQuery] bool? root = null)
         {
-            string query = ADXDataService.NamespaceBySubjectPrelude
-                         + "opcua_metadata_lkv\r\n";
+            var hierarchy = BuildHierarchy();
+
+            IEnumerable<Isa95Hierarchy.Node> nodes;
+
             if (!string.IsNullOrEmpty(typeElementId))
             {
-                // Objects whose telemetry includes the given variable type
-                query += "| where Type in (" + ADXDataService.ToKqlStringList([typeElementId]) + ")\r\n";
+                // A type is a namespace-qualified OPC UA DataType ("<namespaceUri>#<dataType>"), matching the
+                // ids returned by ObjectTypesController. Filtering by it returns the variables of that type -
+                // this is how the I3X namespace view drills from a namespace's types to their objects.
+                var parsed = ObjectTypeId.Parse(typeElementId);
+                nodes = hierarchy.ById.Values.Where(n =>
+                    n.Kind == Isa95Hierarchy.NodeKind.Variable &&
+                    (parsed is { } p
+                        ? string.Equals(n.NamespaceUri, p.NamespaceUri, StringComparison.Ordinal) &&
+                          string.Equals(n.TypeToken, p.Name, StringComparison.Ordinal)
+                        : string.Equals(n.TypeToken, typeElementId, StringComparison.Ordinal)));
             }
-            if (root == true)
+            else if (root == true)
             {
-                // Root Objects are those without a parent node.
-                query += "| where isempty(NodeId)\r\n";
+                // Roots are the top-most ISA-95 container levels (or root assets when a server provides no
+                // ISA-95 context at all).
+                nodes = hierarchy.Roots;
             }
-            query += ADXDataService.ResolveNamespaceUri() + "\r\n"
-                   + "| project NodeId, DisplayName, Type, DataSetWriterID = Subject, NamespaceUri";
+            else
+            {
+                nodes = hierarchy.ById.Values;
+            }
 
-            var rows = _kusto.RunQueryRows(query);
-
-            var results = rows.Select(r => MapObject(r, includeMetadata)).ToList();
+            var results = nodes.Select(n => MapNode(n, includeMetadata)).ToList();
 
             return Ok(new SuccessResponse<IReadOnlyList<ObjectInstanceResponse>>(true, results));
         }
@@ -49,22 +105,10 @@ namespace I3xKustoAdapter.Controllers
         [HttpPost("list")]
         public ActionResult<BulkResponse<ObjectInstanceResponse>> ListObjects([FromBody] GetObjectsRequest request)
         {
-            string inClause = ADXDataService.ToKqlStringList(request.ElementIds);
+            var hierarchy = BuildHierarchy();
 
-            string query = ADXDataService.NamespaceBySubjectPrelude
-                         + "opcua_metadata_lkv\r\n"
-                         + "| where Subject in (" + inClause + ")\r\n"
-                         + ADXDataService.ResolveNamespaceUri() + "\r\n"
-                         + "| project NodeId, DisplayName, Type, DataSetWriterID = Subject, NamespaceUri";
-
-            var rows = _kusto.RunQueryRows(query);
-
-            var byId = rows
-                .GroupBy(r => Str(r, "DataSetWriterID"))
-                .ToDictionary(g => g.Key, g => MapObject(g.First(), request.IncludeMetadata));
-
-            var items = request.ElementIds.Select(id => byId.TryGetValue(id, out var obj)
-                ? BulkResultItem<ObjectInstanceResponse>.Ok(id, obj)
+            var items = request.ElementIds.Select(id => hierarchy.TryGet(id, out var node)
+                ? BulkResultItem<ObjectInstanceResponse>.Ok(id, MapNode(node, request.IncludeMetadata))
                 : BulkResultItem<ObjectInstanceResponse>.NotFound(id, "Object not found")).ToList();
 
             return Ok(new BulkResponse<ObjectInstanceResponse>(true, items));
@@ -73,117 +117,40 @@ namespace I3xKustoAdapter.Controllers
         [HttpPost("related")]
         public ActionResult<BulkResponse<List<RelatedObjectResult>>> QueryRelatedObjects([FromBody] GetRelatedObjectsRequest request)
         {
-            string inClause = ADXDataService.ToKqlStringList(request.ElementIds);
-
             // Resolve the requested relationship type (default HasComponent). i3X relationships are
             // directional: a "forward" type (e.g. HasComponent, Organizes) walks from a parent to its
             // children, and its reverse (e.g. ComponentOf, OrganizedBy) walks from a child to its parent.
             string requestedType = string.IsNullOrEmpty(request.RelationshipType) ? "HasComponent" : request.RelationshipType;
             RelationshipDirection direction = ResolveDirection(requestedType);
 
-            // Determine which requested Objects (by DataSetWriterID) actually exist,
-            // so unknown elementIds can be reported as NotFound.
-            string existsQuery = "opcua_metadata_lkv\r\n"
-                               + "| where Subject in (" + inClause + ")\r\n"
-                               + "| distinct DataSetWriterID = Subject";
-
-            var existing = new HashSet<string>(
-                _kusto.RunQueryRows(existsQuery).Select(r => Str(r, "DataSetWriterID")));
-
-            // An unknown/unsupported relationship type yields no related objects (rather than mislabeling).
-            var bySource = direction == RelationshipDirection.Unsupported
-                ? new Dictionary<string, List<RelatedObjectResult>>()
-                : QueryRelatedByIsa95(inClause, requestedType, direction, request.IncludeMetadata);
+            var hierarchy = BuildHierarchy();
 
             var items = request.ElementIds.Select(id =>
             {
-                if (!existing.Contains(id))
+                if (!hierarchy.TryGet(id, out _))
                 {
                     return BulkResultItem<List<RelatedObjectResult>>.NotFound(id, "Object not found");
                 }
 
-                var related = bySource.TryGetValue(id, out var rel) ? rel : new List<RelatedObjectResult>();
+                // Navigate the synthesized ISA-95 tree: forward => direct children, reverse => parent.
+                // Unsupported/unknown relationship types yield no related objects (rather than mislabeling).
+                IEnumerable<Isa95Hierarchy.Node> neighbors = direction switch
+                {
+                    RelationshipDirection.Forward => hierarchy.ChildrenOf(id),
+                    RelationshipDirection.Reverse => hierarchy.ParentOf(id) is { } parent
+                        ? new[] { parent }
+                        : Array.Empty<Isa95Hierarchy.Node>(),
+                    _ => Array.Empty<Isa95Hierarchy.Node>()
+                };
+
+                var related = neighbors
+                    .Select(n => new RelatedObjectResult(requestedType, MapNode(n, request.IncludeMetadata)))
+                    .ToList();
+
                 return BulkResultItem<List<RelatedObjectResult>>.Ok(id, related);
             }).ToList();
 
             return Ok(new BulkResponse<List<RelatedObjectResult>>(true, items));
-        }
-
-        /// <summary>
-        /// Walks the ISA-95 containment hierarchy (Enterprise &gt; Site &gt; Area &gt; Line &gt; Workcell)
-        /// carried in the OPC UA metadata. Forward (HasComponent/Organizes) returns the direct children
-        /// of each source object; reverse (ComponentOf/OrganizedBy) returns the direct parent. Falls back
-        /// to NodeId-sibling grouping when the ISA-95 levels are not populated.
-        /// </summary>
-        private Dictionary<string, List<RelatedObjectResult>> QueryRelatedByIsa95(
-            string inClause, string sourceRelationship, RelationshipDirection direction, bool includeMetadata)
-        {
-            // Bring back the source objects with their full ISA-95 path, then all candidate objects, and
-            // relate them by direct containment (parent/child differ by exactly one populated level).
-            string query = "let sources = opcua_metadata_lkv\r\n"
-                         + "| where Subject in (" + inClause + ")\r\n"
-                         + "| distinct SourceId = Subject, Workcell, Line, Area, Site, Enterprise, NodeId;\r\n"
-                         + "let candidates = opcua_metadata_lkv\r\n"
-                         + "| distinct Subject, NodeId, DisplayName, Type, NamespaceUri, Workcell, Line, Area, Site, Enterprise;\r\n"
-                         + "sources\r\n"
-                         + "| extend srcDepth = tolong(isnotempty(Enterprise)) + tolong(isnotempty(Site)) + tolong(isnotempty(Area)) + tolong(isnotempty(Line)) + tolong(isnotempty(Workcell))\r\n"
-                         + "| join kind=inner (\r\n"
-                         + "    candidates\r\n"
-                         + "    | extend candDepth = tolong(isnotempty(Enterprise)) + tolong(isnotempty(Site)) + tolong(isnotempty(Area)) + tolong(isnotempty(Line)) + tolong(isnotempty(Workcell))\r\n"
-                         + ") on Enterprise\r\n"
-                         + "| where Subject != SourceId\r\n"
-                         // Same higher-level ancestry, differing by exactly one containment level.
-                         + "| where (Site == Site1) and (Area == Area1) and (Line == Line1)\r\n";
-
-            // Direction selects whether we return the deeper (child) or shallower (parent) neighbor.
-            query += direction == RelationshipDirection.Reverse
-                ? "| where candDepth == srcDepth - 1\r\n"
-                : "| where candDepth == srcDepth + 1\r\n";
-
-            query += "| project SourceId, DataSetWriterID = Subject, NodeId = NodeId1, DisplayName = DisplayName1, Type = Type1, NamespaceUri = NamespaceUri1";
-
-            List<Dictionary<string, object>> rows;
-            try
-            {
-                rows = _kusto.RunQueryRows(query);
-            }
-            catch
-            {
-                rows = new List<Dictionary<string, object>>();
-            }
-
-            // Fallback: if ISA-95 levels are not populated, group by shared parent NodeId (siblings).
-            if (rows.Count == 0)
-            {
-                rows = QueryRelatedBySiblingNodeId(inClause);
-            }
-
-            return rows
-                .GroupBy(r => Str(r, "SourceId"))
-                .ToDictionary(
-                    g => g.Key,
-                    g => g.Select(r => new RelatedObjectResult(
-                        sourceRelationship,
-                        MapObject(r, includeMetadata))).ToList());
-        }
-
-        /// <summary>Legacy behavior: related objects are siblings sharing the same parent NodeId.</summary>
-        private List<Dictionary<string, object>> QueryRelatedBySiblingNodeId(string inClause)
-        {
-            string query = ADXDataService.NamespaceBySubjectPrelude
-                         + "opcua_metadata_lkv\r\n"
-                         + "| where Subject in (" + inClause + ")\r\n"
-                         + "| where isnotempty(NodeId)\r\n"
-                         + "| distinct SourceId = Subject, NodeId\r\n"
-                         + "| join kind=inner (\r\n"
-                         + "    opcua_metadata_lkv\r\n"
-                         + "    | distinct Subject, NodeId, DisplayName, Type, NamespaceUri\r\n"
-                         + ") on NodeId\r\n"
-                         + "| where Subject != SourceId\r\n"
-                         + ADXDataService.ResolveNamespaceUri() + "\r\n"
-                         + "| project SourceId, NodeId, DisplayName, Type, DataSetWriterID = Subject, NamespaceUri";
-
-            return _kusto.RunQueryRows(query);
         }
 
         /// <summary>Direction of an i3X relationship relative to the ISA-95 containment hierarchy.</summary>
@@ -223,50 +190,76 @@ namespace I3xKustoAdapter.Controllers
         [HttpPost("value")]
         public ActionResult<BulkResponse<CurrentValueResult>> QueryValue([FromBody] GetObjectValueRequest request)
         {
-            string inClause = ADXDataService.ToKqlStringList(request.ElementIds);
+            var hierarchy = BuildHierarchy();
+
+            // Map each requested ElementId to the underlying telemetry Subject(s) so both asset ids and
+            // individual variable ids (Subject::Name) can be answered.
+            var subjects = ResolveSubjects(hierarchy, request.ElementIds);
+            string inClause = ADXDataService.ToKqlStringList(subjects.ToArray());
 
             string query = "opcua_telemetry\r\n"
                          + "| where Subject in (" + inClause + ")\r\n"
-                         + "| where Timestamp > now(- 1h)\r\n"
+                         + "| where Timestamp > now(-1h)\r\n"
                          + "| summarize arg_max(Timestamp, Value) by Subject, Name\r\n"
-                         + "| project DataSetWriterID = Subject, Name, Timestamp, Value = todouble(Value)\r\n"
-                         + "| sort by DataSetWriterID asc, Timestamp desc";
+                         + "| project Subject, Name, Timestamp, Value = tostring(Value)";
 
-            var rows = _kusto.RunQueryRows(query);
+            var rows = subjects.Count == 0 ? new List<Dictionary<string, object>>() : _kusto.RunQueryRows(query);
 
-            var byId = rows.GroupBy(r => Str(r, "DataSetWriterID"))
-                           .ToDictionary(g => g.Key, g => g.ToList());
+            // Index telemetry by Subject, and by Subject::Name for direct variable lookups.
+            var bySubject = rows.GroupBy(r => Str(r, "Subject"))
+                                .ToDictionary(g => g.Key, g => g.ToList());
 
             var items = request.ElementIds.Select(id =>
             {
-                if (!byId.TryGetValue(id, out var group))
+                if (!hierarchy.TryGet(id, out var node))
                 {
-                    return BulkResultItem<CurrentValueResult>.NotFound(id, "No current value available");
+                    return BulkResultItem<CurrentValueResult>.NotFound(id, "Object not found");
                 }
 
-                var components = new Dictionary<string, VQT>();
-                DateTime latest = DateTime.MinValue;
-
-                foreach (var row in group)
+                // Variable leaf: return the single scalar value of this field.
+                if (node.Kind == Isa95Hierarchy.NodeKind.Variable)
                 {
-                    string ts = "";
-                    if (row.TryGetValue("Timestamp", out var t) && t is DateTime dt)
+                    var row = bySubject.TryGetValue(node.Subject, out var g)
+                        ? g.FirstOrDefault(r => Str(r, "Name") == node.VariableName)
+                        : null;
+                    if (row == null)
                     {
-                        if (dt > latest) latest = dt;
-                        ts = ToRfc3339(dt);
+                        return BulkResultItem<CurrentValueResult>.NotFound(id, "No current value available");
                     }
 
-                    components[Str(row, "Name")] = new VQT(row.GetValueOrDefault("Value"), "Good", ts);
+                    string ts = row.TryGetValue("Timestamp", out var t) && t is DateTime dt ? ToRfc3339(dt) : "";
+                    var vr = new CurrentValueResult(false, row.GetValueOrDefault("Value"), "Good", ts);
+                    return BulkResultItem<CurrentValueResult>.Ok(id, vr);
                 }
 
-                var result = new CurrentValueResult(
-                    true,
-                    null,
-                    "Good",
-                    latest == DateTime.MinValue ? "" : ToRfc3339(latest),
-                    request.MaxDepth != 1 ? components : null);
+                // Asset (or other composition): return the components map of all its variables.
+                if (node.IsAsset && bySubject.TryGetValue(node.Subject, out var group))
+                {
+                    var components = new Dictionary<string, VQT>();
+                    DateTime latest = DateTime.MinValue;
+                    foreach (var row in group)
+                    {
+                        string ts = "";
+                        if (row.TryGetValue("Timestamp", out var t) && t is DateTime dt)
+                        {
+                            if (dt > latest) latest = dt;
+                            ts = ToRfc3339(dt);
+                        }
+                        components[Str(row, "Name")] = new VQT(row.GetValueOrDefault("Value"), "Good", ts);
+                    }
 
-                return BulkResultItem<CurrentValueResult>.Ok(id, result);
+                    var result = new CurrentValueResult(
+                        true,
+                        null,
+                        "Good",
+                        latest == DateTime.MinValue ? "" : ToRfc3339(latest),
+                        request.MaxDepth != 1 ? components : null);
+
+                    return BulkResultItem<CurrentValueResult>.Ok(id, result);
+                }
+
+                // Containers (and assets with no telemetry) have no direct current value.
+                return BulkResultItem<CurrentValueResult>.NotFound(id, "No current value available");
             }).ToList();
 
             return Ok(new BulkResponse<CurrentValueResult>(true, items));
@@ -275,32 +268,38 @@ namespace I3xKustoAdapter.Controllers
         [HttpPost("history")]
         public ActionResult<BulkResponse<HistoricalValueResult>> QueryHistory([FromBody] GetObjectHistoryRequest request)
         {
-            string inClause = ADXDataService.ToKqlStringList(request.ElementIds);
+            var hierarchy = BuildHierarchy();
+            var subjects = ResolveSubjects(hierarchy, request.ElementIds);
+            string inClause = ADXDataService.ToKqlStringList(subjects.ToArray());
             string start = request.StartTime ?? DateTime.UtcNow.AddHours(-1).ToString("o");
             string end = request.EndTime ?? DateTime.UtcNow.ToString("o");
 
             string query = "opcua_telemetry\r\n"
                          + "| where Subject in (" + inClause + ")\r\n"
                          + "| where Timestamp between (datetime(\"" + start + "\") .. datetime(\"" + end + "\"))\r\n"
-                         + "| project DataSetWriterID = Subject, Name, Timestamp, Value = todouble(Value)\r\n"
-                         + "| sort by DataSetWriterID asc, Timestamp desc";
+                         + "| project Subject, Name, Timestamp, Value = tostring(Value)\r\n"
+                         + "| sort by Subject asc, Timestamp desc";
 
-            var rows = _kusto.RunQueryRows(query);
+            var rows = subjects.Count == 0 ? new List<Dictionary<string, object>>() : _kusto.RunQueryRows(query);
 
-            var byId = rows.GroupBy(r => Str(r, "DataSetWriterID"))
-                           .ToDictionary(g => g.Key, g => g.ToList());
+            var bySubject = rows.GroupBy(r => Str(r, "Subject"))
+                                .ToDictionary(g => g.Key, g => g.ToList());
 
             var items = request.ElementIds.Select(id =>
             {
-                if (!byId.TryGetValue(id, out var group))
+                if (!hierarchy.TryGet(id, out var node))
                 {
-                    return BulkResultItem<HistoricalValueResult>.NotFound(id, "No historical values available");
+                    return BulkResultItem<HistoricalValueResult>.NotFound(id, "Object not found");
                 }
 
-                var components = new Dictionary<string, object>();
-                foreach (var nameGroup in group.GroupBy(r => Str(r, "Name")))
+                // Variable leaf: return its own time series directly in "values".
+                if (node.Kind == Isa95Hierarchy.NodeKind.Variable)
                 {
-                    var vqts = nameGroup
+                    var series = bySubject.TryGetValue(node.Subject, out var g)
+                        ? g.Where(r => Str(r, "Name") == node.VariableName)
+                        : Enumerable.Empty<Dictionary<string, object>>();
+
+                    var values = series
                         .Select(r => new
                         {
                             Row = r,
@@ -313,31 +312,62 @@ namespace I3xKustoAdapter.Controllers
                             x.Ts == DateTime.MinValue ? "" : ToRfc3339(x.Ts)))
                         .ToList();
 
-                    components[nameGroup.Key] = vqts;
+                    return BulkResultItem<HistoricalValueResult>.Ok(id,
+                        new HistoricalValueResult(false, values, null));
                 }
 
-                var result = new HistoricalValueResult(
-                    true,
-                    Array.Empty<VQT>(),
-                    request.MaxDepth != 1 ? components : null);
+                // Asset: return per-variable series in the components map.
+                if (node.IsAsset && bySubject.TryGetValue(node.Subject, out var group))
+                {
+                    var components = new Dictionary<string, object>();
+                    foreach (var nameGroup in group.GroupBy(r => Str(r, "Name")))
+                    {
+                        var vqts = nameGroup
+                            .Select(r => new
+                            {
+                                Row = r,
+                                Ts = r.TryGetValue("Timestamp", out var t) && t is DateTime dt ? dt : DateTime.MinValue
+                            })
+                            .OrderByDescending(x => x.Ts)
+                            .Select(x => new VQT(
+                                x.Row.GetValueOrDefault("Value"),
+                                "Good",
+                                x.Ts == DateTime.MinValue ? "" : ToRfc3339(x.Ts)))
+                            .ToList();
 
-                return BulkResultItem<HistoricalValueResult>.Ok(id, result);
+                        components[nameGroup.Key] = vqts;
+                    }
+
+                    var result = new HistoricalValueResult(
+                        true,
+                        Array.Empty<VQT>(),
+                        request.MaxDepth != 1 ? components : null);
+
+                    return BulkResultItem<HistoricalValueResult>.Ok(id, result);
+                }
+
+                // Containers (and assets with no telemetry) have no historical values.
+                return BulkResultItem<HistoricalValueResult>.NotFound(id, "No historical values available");
             }).ToList();
 
             return Ok(new BulkResponse<HistoricalValueResult>(true, items));
         }
 
-        private static ObjectInstanceResponse MapObject(Dictionary<string, object> r, bool includeMetadata)
+        /// <summary>
+        /// Resolves the requested ElementIds (which may be container, asset or variable ids) to the distinct
+        /// set of underlying telemetry Subjects to query.
+        /// </summary>
+        private static IReadOnlyCollection<string> ResolveSubjects(Isa95Hierarchy hierarchy, IEnumerable<string> elementIds)
         {
-            string parentId = Str(r, "NodeId");
-            return new ObjectInstanceResponse(
-                Str(r, "DataSetWriterID"),
-                Str(r, "DisplayName"),
-                Str(r, "Type"),
-                false,
-                string.IsNullOrEmpty(parentId) ? null : parentId,
-                false,
-                includeMetadata ? BuildMetadata(Str(r, "NamespaceUri"), Str(r, "Type")) : null);
+            var subjects = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var id in elementIds)
+            {
+                if (hierarchy.TryGet(id, out var node) && !string.IsNullOrEmpty(node.Subject))
+                {
+                    subjects.Add(node.Subject);
+                }
+            }
+            return subjects;
         }
 
         private static ObjectInstanceMetadata BuildMetadata(string namespaceUri, string sourceTypeId) =>
