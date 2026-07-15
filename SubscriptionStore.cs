@@ -60,6 +60,42 @@ namespace I3X4Kusto
             /// <summary>Element id -> last delivered value timestamp (UTC), so only newer values are sent.</summary>
             public ConcurrentDictionary<string, DateTime> LastSeen { get; } = new();
 
+            // Tracks the currently active SSE stream. Only one stream is allowed per subscription; opening a
+            // new one supersedes (cleanly cancels) the previous one.
+            private CancellationTokenSource _streamCts;
+
+            /// <summary>
+            /// Registers a newly opened stream as the sole active stream, cleanly cancelling any previously
+            /// active stream. Returns the cancellation source for this stream; observe its token and pass it
+            /// back to <see cref="EndStream"/> when the stream ends.
+            /// </summary>
+            public CancellationTokenSource BeginStream()
+            {
+                var cts = new CancellationTokenSource();
+                var previous = Interlocked.Exchange(ref _streamCts, cts);
+                if (previous != null)
+                {
+                    // Signal the previously connected client's stream to end cleanly (no error).
+                    try { previous.Cancel(); } catch (ObjectDisposedException) { }
+                    previous.Dispose();
+                }
+
+                return cts;
+            }
+
+            /// <summary>Clears the active stream registration when a stream ends, if it is still the current one.</summary>
+            public void EndStream(CancellationTokenSource cts)
+            {
+                if (cts == null)
+                {
+                    return;
+                }
+
+                // Only clear if this stream is still the active one (a newer stream may have superseded it).
+                Interlocked.CompareExchange(ref _streamCts, null, cts);
+                cts.Dispose();
+            }
+
             public void AddElements(IEnumerable<string> elementIds, int maxDepth)
             {
                 foreach (var id in elementIds ?? Enumerable.Empty<string>())

@@ -273,8 +273,8 @@ namespace I3xKustoAdapter.Controllers
                     var result = new CurrentValueResult(
                         true,
                         null,
-                        "Good",
-                        latest == DateTime.MinValue ? "" : ToRfc3339(latest),
+                        "GoodNoData",
+                        latest == DateTime.MinValue ? ToRfc3339(DateTime.UtcNow) : ToRfc3339(latest),
                         request.MaxDepth != 1 ? components : null);
 
                     return BulkResultItem<CurrentValueResult>.Ok(id, result);
@@ -310,8 +310,8 @@ namespace I3xKustoAdapter.Controllers
                     var composition = new CurrentValueResult(
                         true,
                         null,
-                        "Good",
-                        latest == DateTime.MinValue ? "" : ToRfc3339(latest),
+                        "GoodNoData",
+                        latest == DateTime.MinValue ? ToRfc3339(DateTime.UtcNow) : ToRfc3339(latest),
                         components);
                     return BulkResultItem<CurrentValueResult>.Ok(id, composition);
                 }

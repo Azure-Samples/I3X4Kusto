@@ -216,28 +216,39 @@ namespace I3xKustoAdapter.Controllers
 
             int pollMs = GetStreamPollMs();
 
+            // Only a single stream is allowed per subscription. Registering this stream cleanly cancels any
+            // previously active stream, and gives us a token that fires if a later stream supersedes us.
+            var streamCts = sub.BeginStream();
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, streamCts.Token);
+            CancellationToken token = linkedCts.Token;
+
             try
             {
-                while (!cancellationToken.IsCancellationRequested)
+                while (!token.IsCancellationRequested)
                 {
                     StageNewValues(sub);
 
                     foreach (var batch in sub.PendingSnapshot())
                     {
                         string json = JsonSerializer.Serialize(batch);
-                        await Response.WriteAsync($"data: {json}\n\n", cancellationToken).ConfigureAwait(false);
-                        await Response.Body.FlushAsync(cancellationToken).ConfigureAwait(false);
+                        await Response.WriteAsync($"data: {json}\n\n", token).ConfigureAwait(false);
+                        await Response.Body.FlushAsync(token).ConfigureAwait(false);
 
                         // In stream mode each batch is delivered once, then acknowledged.
                         sub.Acknowledge(batch.SequenceNumber);
                     }
 
-                    await Task.Delay(pollMs, cancellationToken).ConfigureAwait(false);
+                    await Task.Delay(pollMs, token).ConfigureAwait(false);
                 }
             }
             catch (OperationCanceledException)
             {
-                // client disconnected - normal end of stream
+                // Client disconnected, or this stream was superseded by a newer one. Either way the SSE
+                // stream ends cleanly (no error) so the previously connected client sees a normal close.
+            }
+            finally
+            {
+                sub.EndStream(streamCts);
             }
         }
 
