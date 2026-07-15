@@ -1,6 +1,7 @@
 ﻿namespace I3X4Kusto
 {
     using System.Collections.Generic;
+    using System.Linq;
     using System.Text.Json.Serialization;
 
     // ---------------------------------------------------------------------
@@ -15,7 +16,15 @@
     /// <summary>Envelope for bulk endpoints: { success, results: [...] }.</summary>
     public sealed record BulkResponse<T>(
         [property: JsonPropertyName("success")] bool Success,
-        [property: JsonPropertyName("results")] IReadOnlyList<BulkResultItem<T>> Results);
+        [property: JsonPropertyName("results")] IReadOnlyList<BulkResultItem<T>> Results)
+    {
+        /// <summary>
+        /// Builds a bulk response whose top-level success is false when any item failed, as required by the
+        /// i3X spec's bulk-response contract.
+        /// </summary>
+        public static BulkResponse<T> Create(IReadOnlyList<BulkResultItem<T>> results) =>
+            new(results.All(r => r.Success), results);
+    }
 
     /// <summary>A single item within a <see cref="BulkResponse{T}"/>.</summary>
     public sealed record BulkResultItem<T>

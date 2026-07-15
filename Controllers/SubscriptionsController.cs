@@ -56,22 +56,26 @@ namespace I3xKustoAdapter.Controllers
             }
 
             int maxDepth = request.MaxDepth ?? 1;
-            sub.AddElements(request.ElementIds, maxDepth);
 
-            // Seed the high-water mark so register only delivers values that arrive AFTER registration.
+            // Validate each elementId against the address space so unknown ids fail per-item with a 404,
+            // rather than being silently registered.
+            var hierarchy = new Isa95Hierarchy(_kusto.GetIsa95LeafAssets());
             DateTime now = DateTime.UtcNow;
-            foreach (var id in request.ElementIds ?? Array.Empty<string>())
-            {
-                if (!string.IsNullOrEmpty(id))
-                {
-                    sub.LastSeen[id] = now;
-                }
-            }
 
-            var items = (request.ElementIds ?? Array.Empty<string>())
-                .Select(id => BulkResultItem<object>.Ok(id, null))
-                .ToList();
-            return Ok(new BulkResponse<object>(true, items));
+            var items = (request.ElementIds ?? Array.Empty<string>()).Select(id =>
+            {
+                if (string.IsNullOrEmpty(id) || !hierarchy.TryGet(id, out _))
+                {
+                    return BulkResultItem<object>.NotFound(id, "Object not found");
+                }
+
+                sub.AddElements(new[] { id }, maxDepth);
+                // Seed the high-water mark so register only delivers values that arrive AFTER registration.
+                sub.LastSeen[id] = now;
+                return BulkResultItem<object>.Ok(id, null);
+            }).ToList();
+
+            return Ok(new BulkResponse<object>(items.All(i => i.Success), items));
         }
 
         // POST /v1/subscriptions/unregister
@@ -83,12 +87,21 @@ namespace I3xKustoAdapter.Controllers
                 return error;
             }
 
-            sub.RemoveElements(request.ElementIds);
+            // Validate each elementId so unknown ids are reported per-item rather than silently succeeding.
+            var hierarchy = new Isa95Hierarchy(_kusto.GetIsa95LeafAssets());
 
-            var items = (request.ElementIds ?? Array.Empty<string>())
-                .Select(id => BulkResultItem<object>.Ok(id, null))
-                .ToList();
-            return Ok(new BulkResponse<object>(true, items));
+            var items = (request.ElementIds ?? Array.Empty<string>()).Select(id =>
+            {
+                if (string.IsNullOrEmpty(id) || !hierarchy.TryGet(id, out _))
+                {
+                    return BulkResultItem<object>.NotFound(id, "Object not found");
+                }
+
+                sub.RemoveElements(new[] { id });
+                return BulkResultItem<object>.Ok(id, null);
+            }).ToList();
+
+            return Ok(new BulkResponse<object>(items.All(i => i.Success), items));
         }
 
         // POST /v1/subscriptions/list
@@ -124,7 +137,7 @@ namespace I3xKustoAdapter.Controllers
                 };
             }).ToList();
 
-            return Ok(new BulkResponse<SubscriptionDetail>(true, items));
+            return Ok(new BulkResponse<SubscriptionDetail>(items.All(i => i.Success), items));
         }
 
         // POST /v1/subscriptions/delete
@@ -151,7 +164,7 @@ namespace I3xKustoAdapter.Controllers
                 };
             }).ToList();
 
-            return Ok(new BulkResponse<object>(true, items));
+            return Ok(new BulkResponse<object>(items.All(i => i.Success), items));
         }
 
         // POST /v1/subscriptions/sync

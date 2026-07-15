@@ -10,6 +10,19 @@ namespace I3X4Kusto.Controllers
     {
         private readonly ADXDataService _kusto;
 
+        // Synthetic ISA-95 container level types. Container objects (Enterprise/Site/Area/Line/Workcell)
+        // carry a typeElementId of "ISA95:<Level>", so those types must be registered here for every
+        // object's typeElementId to resolve.
+        private static readonly string[] Isa95Levels = { "Enterprise", "Site", "Area", "Line", "Workcell" };
+
+        private static IEnumerable<ObjectTypeResponse> Isa95ContainerTypes() =>
+            Isa95Levels.Select(level => new ObjectTypeResponse(
+                "ISA95:" + level,
+                level,
+                Isa95Hierarchy.Isa95NamespaceUri,
+                "ISA95:" + level,
+                new Dictionary<string, object>()));
+
         public ObjectTypesController(ADXDataService kusto)
         {
             _kusto = kusto;
@@ -34,6 +47,11 @@ namespace I3X4Kusto.Controllers
                 .Select(t => MapObjectType(t.NamespaceUri, t.Token))
                 .ToList();
 
+            // Include the synthetic ISA-95 container level types (filtered by namespace when requested).
+            types.AddRange(Isa95ContainerTypes()
+                .Where(t => string.IsNullOrEmpty(namespaceUri) ||
+                            string.Equals(t.NamespaceUri, namespaceUri, System.StringComparison.Ordinal)));
+
             return Ok(new SuccessResponse<IReadOnlyList<ObjectTypeResponse>>(true, types));
         }
 
@@ -52,11 +70,16 @@ namespace I3X4Kusto.Controllers
                 .GroupBy(t => t.ElementId)
                 .ToDictionary(g => g.Key, g => g.First());
 
+            foreach (var containerType in Isa95ContainerTypes())
+            {
+                byId[containerType.ElementId] = containerType;
+            }
+
             var items = request.ElementIds.Select(id => byId.TryGetValue(id, out var ot)
                 ? BulkResultItem<ObjectTypeResponse>.Ok(id, ot)
                 : BulkResultItem<ObjectTypeResponse>.NotFound(id, "Object type not found")).ToList();
 
-            return Ok(new BulkResponse<ObjectTypeResponse>(true, items));
+            return Ok(new BulkResponse<ObjectTypeResponse>(items.All(i => i.Success), items));
         }
 
         private static ObjectTypeResponse MapObjectType(string namespaceUri, string token)
