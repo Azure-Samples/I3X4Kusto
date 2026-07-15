@@ -34,6 +34,13 @@ namespace I3X4Kusto.Controllers
                 .Select(uri => new Namespace(uri, ExtractNameFromUri(uri)))
                 .ToList();
 
+            // Always advertise the synthetic ISA-95 namespace that the container object types belong to,
+            // so every Object Type resolves to a declared Namespace.
+            if (!results.Any(n => n.Uri == Isa95Hierarchy.Isa95NamespaceUri))
+            {
+                results.Add(new Namespace(Isa95Hierarchy.Isa95NamespaceUri, "ISA95"));
+            }
+
             return Ok(new SuccessResponse<IReadOnlyList<Namespace>>(true, results));
         }
 

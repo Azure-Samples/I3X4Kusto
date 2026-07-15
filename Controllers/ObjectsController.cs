@@ -75,16 +75,27 @@ namespace I3xKustoAdapter.Controllers
 
             if (!string.IsNullOrEmpty(typeElementId))
             {
-                // A type is a namespace-qualified OPC UA DataType ("<namespaceUri>#<dataType>"), matching the
-                // ids returned by ObjectTypesController. Filtering by it returns the variables of that type -
-                // this is how the I3X namespace view drills from a namespace's types to their objects.
-                var parsed = ObjectTypeId.Parse(typeElementId);
-                nodes = hierarchy.ById.Values.Where(n =>
-                    n.Kind == Isa95Hierarchy.NodeKind.Variable &&
-                    (parsed is { } p
-                        ? string.Equals(n.NamespaceUri, p.NamespaceUri, StringComparison.Ordinal) &&
-                          string.Equals(n.TypeToken, p.Name, StringComparison.Ordinal)
-                        : string.Equals(n.TypeToken, typeElementId, StringComparison.Ordinal)));
+                if (typeElementId.StartsWith(ContainerTypePrefix, StringComparison.Ordinal))
+                {
+                    // ISA-95 container level type (e.g. "ISA95:Site"): return the container objects at that
+                    // level so a namespace -> type -> object drilldown works for structural nodes too.
+                    nodes = hierarchy.ById.Values.Where(n =>
+                        n.Kind == Isa95Hierarchy.NodeKind.Container &&
+                        string.Equals(ContainerTypePrefix + n.Level, typeElementId, StringComparison.Ordinal));
+                }
+                else
+                {
+                    // A type is a namespace-qualified OPC UA DataType ("<namespaceUri>#<dataType>"), matching the
+                    // ids returned by ObjectTypesController. Filtering by it returns the variables of that type -
+                    // this is how the I3X namespace view drills from a namespace's types to their objects.
+                    var parsed = ObjectTypeId.Parse(typeElementId);
+                    nodes = hierarchy.ById.Values.Where(n =>
+                        n.Kind == Isa95Hierarchy.NodeKind.Variable &&
+                        (parsed is { } p
+                            ? string.Equals(n.NamespaceUri, p.NamespaceUri, StringComparison.Ordinal) &&
+                              string.Equals(n.TypeToken, p.Name, StringComparison.Ordinal)
+                            : string.Equals(n.TypeToken, typeElementId, StringComparison.Ordinal)));
+                }
             }
             else if (root == true)
             {
@@ -111,17 +122,20 @@ namespace I3xKustoAdapter.Controllers
                 ? BulkResultItem<ObjectInstanceResponse>.Ok(id, MapNode(node, request.IncludeMetadata))
                 : BulkResultItem<ObjectInstanceResponse>.NotFound(id, "Object not found")).ToList();
 
-            return Ok(new BulkResponse<ObjectInstanceResponse>(true, items));
+            return Ok(new BulkResponse<ObjectInstanceResponse>(items.All(i => i.Success), items));
         }
 
         [HttpPost("related")]
         public ActionResult<BulkResponse<List<RelatedObjectResult>>> QueryRelatedObjects([FromBody] GetRelatedObjectsRequest request)
         {
-            // Resolve the requested relationship type (default HasComponent). i3X relationships are
+            // Resolve the requested relationship type (default: all edges). i3X relationships are
             // directional: a "forward" type (e.g. HasComponent, Organizes) walks from a parent to its
             // children, and its reverse (e.g. ComponentOf, OrganizedBy) walks from a child to its parent.
-            string requestedType = string.IsNullOrEmpty(request.RelationshipType) ? "HasComponent" : request.RelationshipType;
-            RelationshipDirection direction = ResolveDirection(requestedType);
+            // Relationships MUST be traversable in both directions, so when no relationshipType filter is
+            // supplied we return BOTH the child (HasComponent) and parent (ComponentOf) edges.
+            string requestedType = request.RelationshipType;
+            bool allDirections = string.IsNullOrEmpty(requestedType);
+            RelationshipDirection direction = allDirections ? RelationshipDirection.Unsupported : ResolveDirection(requestedType);
 
             var hierarchy = BuildHierarchy();
 
@@ -132,25 +146,33 @@ namespace I3xKustoAdapter.Controllers
                     return BulkResultItem<List<RelatedObjectResult>>.NotFound(id, "Object not found");
                 }
 
-                // Navigate the synthesized ISA-95 tree: forward => direct children, reverse => parent.
-                // Unsupported/unknown relationship types yield no related objects (rather than mislabeling).
-                IEnumerable<Isa95Hierarchy.Node> neighbors = direction switch
-                {
-                    RelationshipDirection.Forward => hierarchy.ChildrenOf(id),
-                    RelationshipDirection.Reverse => hierarchy.ParentOf(id) is { } parent
-                        ? new[] { parent }
-                        : Array.Empty<Isa95Hierarchy.Node>(),
-                    _ => Array.Empty<Isa95Hierarchy.Node>()
-                };
+                var related = new List<RelatedObjectResult>();
 
-                var related = neighbors
-                    .Select(n => new RelatedObjectResult(requestedType, MapNode(n, request.IncludeMetadata)))
-                    .ToList();
+                // Forward edges (parent -> children) are labelled HasComponent.
+                if (allDirections || direction == RelationshipDirection.Forward)
+                {
+                    related.AddRange(hierarchy.ChildrenOf(id)
+                        .Select(n => new RelatedObjectResult(
+                            allDirections ? "HasComponent" : requestedType,
+                            MapNode(n, request.IncludeMetadata))));
+                }
+
+                // Reverse edge (child -> parent) is labelled ComponentOf. Including this makes the
+                // hierarchy reachable through /objects/related and stores relationships bidirectionally.
+                if (allDirections || direction == RelationshipDirection.Reverse)
+                {
+                    if (hierarchy.ParentOf(id) is { } parent)
+                    {
+                        related.Add(new RelatedObjectResult(
+                            allDirections ? "ComponentOf" : requestedType,
+                            MapNode(parent, request.IncludeMetadata)));
+                    }
+                }
 
                 return BulkResultItem<List<RelatedObjectResult>>.Ok(id, related);
             }).ToList();
 
-            return Ok(new BulkResponse<List<RelatedObjectResult>>(true, items));
+            return Ok(new BulkResponse<List<RelatedObjectResult>>(items.All(i => i.Success), items));
         }
 
         /// <summary>Direction of an i3X relationship relative to the ISA-95 containment hierarchy.</summary>
@@ -258,11 +280,47 @@ namespace I3xKustoAdapter.Controllers
                     return BulkResultItem<CurrentValueResult>.Ok(id, result);
                 }
 
-                // Containers (and assets with no telemetry) have no direct current value.
+                // Containers (compositions such as ISA-95 levels, and assets without direct telemetry) do
+                // not have a scalar value of their own. They are readable compositions: at maxDepth 1 they
+                // return no components; deeper they aggregate their descendants' current values.
+                if (node.IsContainer)
+                {
+                    Dictionary<string, VQT> components = null;
+                    DateTime latest = DateTime.MinValue;
+                    if (request.MaxDepth != 1)
+                    {
+                        components = new Dictionary<string, VQT>();
+                        foreach (var subj in CollectSubjects(hierarchy, node))
+                        {
+                            if (!bySubject.TryGetValue(subj, out var descGroup)) continue;
+                            foreach (var row in descGroup)
+                            {
+                                string ts = "";
+                                if (row.TryGetValue("Timestamp", out var t) && t is DateTime dt)
+                                {
+                                    if (dt > latest) latest = dt;
+                                    ts = ToRfc3339(dt);
+                                }
+                                components[Str(row, "Name")] = new VQT(row.GetValueOrDefault("Value"), "Good", ts);
+                            }
+                        }
+                        if (components.Count == 0) components = null;
+                    }
+
+                    var composition = new CurrentValueResult(
+                        true,
+                        null,
+                        "Good",
+                        latest == DateTime.MinValue ? "" : ToRfc3339(latest),
+                        components);
+                    return BulkResultItem<CurrentValueResult>.Ok(id, composition);
+                }
+
+                // Anything else has no current value.
                 return BulkResultItem<CurrentValueResult>.NotFound(id, "No current value available");
             }).ToList();
 
-            return Ok(new BulkResponse<CurrentValueResult>(true, items));
+            return Ok(new BulkResponse<CurrentValueResult>(items.All(i => i.Success), items));
         }
 
         [HttpPost("history")]
@@ -271,8 +329,26 @@ namespace I3xKustoAdapter.Controllers
             var hierarchy = BuildHierarchy();
             var subjects = ResolveSubjects(hierarchy, request.ElementIds);
             string inClause = ADXDataService.ToKqlStringList(subjects.ToArray());
-            string start = request.StartTime ?? DateTime.UtcNow.AddHours(-1).ToString("o");
-            string end = request.EndTime ?? DateTime.UtcNow.ToString("o");
+
+            // The i3X spec requires startTime and endTime in RFC 3339 format; reject requests missing either.
+            if (string.IsNullOrWhiteSpace(request.StartTime) ||
+                !DateTimeOffset.TryParse(request.StartTime, System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.RoundtripKind, out _))
+            {
+                return BadRequest(new ErrorResponse(new ErrorDetail("Bad Request", 400,
+                    "startTime is required and must be an RFC 3339 timestamp.")));
+            }
+
+            if (string.IsNullOrWhiteSpace(request.EndTime) ||
+                !DateTimeOffset.TryParse(request.EndTime, System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.RoundtripKind, out _))
+            {
+                return BadRequest(new ErrorResponse(new ErrorDetail("Bad Request", 400,
+                    "endTime is required and must be an RFC 3339 timestamp.")));
+            }
+
+            string start = request.StartTime;
+            string end = request.EndTime;
 
             string query = "opcua_telemetry\r\n"
                          + "| where Subject in (" + inClause + ")\r\n"
@@ -335,7 +411,7 @@ namespace I3xKustoAdapter.Controllers
                                 x.Ts == DateTime.MinValue ? "" : ToRfc3339(x.Ts)))
                             .ToList();
 
-                        components[nameGroup.Key] = vqts;
+                        components[nameGroup.Key] = new HistoricalValueResult(false, vqts, null);
                     }
 
                     var result = new HistoricalValueResult(
@@ -346,11 +422,47 @@ namespace I3xKustoAdapter.Controllers
                     return BulkResultItem<HistoricalValueResult>.Ok(id, result);
                 }
 
-                // Containers (and assets with no telemetry) have no historical values.
+                // Containers (compositions) aggregate their descendants' history under "components" when a
+                // deeper maxDepth is requested; at maxDepth 1 they return an empty composition result.
+                if (node.IsContainer)
+                {
+                    Dictionary<string, object> components = null;
+                    if (request.MaxDepth != 1)
+                    {
+                        components = new Dictionary<string, object>();
+                        foreach (var subj in CollectSubjects(hierarchy, node))
+                        {
+                            if (!bySubject.TryGetValue(subj, out var descGroup)) continue;
+                            foreach (var nameGroup in descGroup.GroupBy(r => Str(r, "Name")))
+                            {
+                                var vqts = nameGroup
+                                    .Select(r => new
+                                    {
+                                        Row = r,
+                                        Ts = r.TryGetValue("Timestamp", out var t) && t is DateTime dt ? dt : DateTime.MinValue
+                                    })
+                                    .OrderByDescending(x => x.Ts)
+                                    .Select(x => new VQT(
+                                        x.Row.GetValueOrDefault("Value"),
+                                        "Good",
+                                        x.Ts == DateTime.MinValue ? "" : ToRfc3339(x.Ts)))
+                                    .ToList();
+
+                                components[nameGroup.Key] = new HistoricalValueResult(false, vqts, null);
+                            }
+                        }
+                        if (components.Count == 0) components = null;
+                    }
+
+                    return BulkResultItem<HistoricalValueResult>.Ok(id,
+                        new HistoricalValueResult(true, Array.Empty<VQT>(), components));
+                }
+
+                // Anything else has no historical values.
                 return BulkResultItem<HistoricalValueResult>.NotFound(id, "No historical values available");
             }).ToList();
 
-            return Ok(new BulkResponse<HistoricalValueResult>(true, items));
+            return Ok(new BulkResponse<HistoricalValueResult>(items.All(i => i.Success), items));
         }
 
         /// <summary>
@@ -362,11 +474,35 @@ namespace I3xKustoAdapter.Controllers
             var subjects = new HashSet<string>(StringComparer.Ordinal);
             foreach (var id in elementIds)
             {
-                if (hierarchy.TryGet(id, out var node) && !string.IsNullOrEmpty(node.Subject))
+                if (hierarchy.TryGet(id, out var node))
                 {
-                    subjects.Add(node.Subject);
+                    CollectSubjects(hierarchy, node, subjects);
                 }
             }
+            return subjects;
+        }
+
+        /// <summary>
+        /// Collects the telemetry Subject of a node and, for container nodes, of all their descendants so a
+        /// composition object can aggregate the values beneath it.
+        /// </summary>
+        private static void CollectSubjects(Isa95Hierarchy hierarchy, Isa95Hierarchy.Node node, HashSet<string> subjects)
+        {
+            if (!string.IsNullOrEmpty(node.Subject))
+            {
+                subjects.Add(node.Subject);
+            }
+
+            foreach (var child in hierarchy.ChildrenOf(node.ElementId))
+            {
+                CollectSubjects(hierarchy, child, subjects);
+            }
+        }
+
+        private static IReadOnlyCollection<string> CollectSubjects(Isa95Hierarchy hierarchy, Isa95Hierarchy.Node node)
+        {
+            var subjects = new HashSet<string>(StringComparer.Ordinal);
+            CollectSubjects(hierarchy, node, subjects);
             return subjects;
         }
 
@@ -375,7 +511,7 @@ namespace I3xKustoAdapter.Controllers
                 SourceTypeId: string.IsNullOrEmpty(sourceTypeId) ? null : sourceTypeId);
 
         private static string ToRfc3339(DateTime dt) =>
-            new DateTimeOffset(dt, TimeSpan.Zero).ToString("o");
+            DateTime.SpecifyKind(dt, DateTimeKind.Utc).ToString("yyyy-MM-ddTHH:mm:ss.fffffffK");
 
         private static string Str(Dictionary<string, object> row, string key) =>
             row.TryGetValue(key, out var v) ? v?.ToString() ?? "" : "";

@@ -31,7 +31,29 @@ namespace I3X4Kusto.Controllers
             new("ToState", "ToState", "http://opcfoundation.org/UA/", "ToState", "FromTransition"),
             new("HasCause", "HasCause", "http://opcfoundation.org/UA/", "HasCause", "MayBeCausedBy"),
             new("HasEffect", "HasEffect", "http://opcfoundation.org/UA/", "HasEffect", "MayBeAffectedBy"),
-            new("HasGuard", "HasGuard", "http://opcfoundation.org/UA/", "HasGuard", "GuardOf")
+            new("HasGuard", "HasGuard", "http://opcfoundation.org/UA/", "HasGuard", "GuardOf"),
+
+            // Reverse reference types. The i3X spec requires every reverseOf to also be a registered
+            // relationship type, so each forward type above has its inverse registered here pointing back.
+            new("ComponentOf", "ComponentOf", "http://opcfoundation.org/UA/", "ComponentOf", "HasComponent"),
+            new("OrganizedBy", "OrganizedBy", "http://opcfoundation.org/UA/", "OrganizedBy", "Organizes"),
+            new("PropertyOf", "PropertyOf", "http://opcfoundation.org/UA/", "PropertyOf", "HasProperty"),
+            new("SubtypeOf", "SubtypeOf", "http://opcfoundation.org/UA/", "SubtypeOf", "HasSubtype"),
+            new("TypeDefinitionOf", "TypeDefinitionOf", "http://opcfoundation.org/UA/", "TypeDefinitionOf", "HasTypeDefinition"),
+            new("ModellingRuleOf", "ModellingRuleOf", "http://opcfoundation.org/UA/", "ModellingRuleOf", "HasModellingRule"),
+            new("EncodingOf", "EncodingOf", "http://opcfoundation.org/UA/", "EncodingOf", "HasEncoding"),
+            new("DescriptionOf", "DescriptionOf", "http://opcfoundation.org/UA/", "DescriptionOf", "HasDescription"),
+            new("GeneratedBy", "GeneratedBy", "http://opcfoundation.org/UA/", "GeneratedBy", "GeneratesEvent"),
+            new("AlwaysGeneratedBy", "AlwaysGeneratedBy", "http://opcfoundation.org/UA/", "AlwaysGeneratedBy", "AlwaysGeneratesEvent"),
+            new("NotifierOf", "NotifierOf", "http://opcfoundation.org/UA/", "NotifierOf", "HasNotifier"),
+            new("EventSourceOf", "EventSourceOf", "http://opcfoundation.org/UA/", "EventSourceOf", "HasEventSource"),
+            new("IsConditionOf", "IsConditionOf", "http://opcfoundation.org/UA/", "IsConditionOf", "HasCondition"),
+            new("OrderedComponentOf", "OrderedComponentOf", "http://opcfoundation.org/UA/", "OrderedComponentOf", "HasOrderedComponent"),
+            new("ToTransition", "ToTransition", "http://opcfoundation.org/UA/", "ToTransition", "FromState"),
+            new("FromTransition", "FromTransition", "http://opcfoundation.org/UA/", "FromTransition", "ToState"),
+            new("MayBeCausedBy", "MayBeCausedBy", "http://opcfoundation.org/UA/", "MayBeCausedBy", "HasCause"),
+            new("MayBeAffectedBy", "MayBeAffectedBy", "http://opcfoundation.org/UA/", "MayBeAffectedBy", "HasEffect"),
+            new("GuardOf", "GuardOf", "http://opcfoundation.org/UA/", "GuardOf", "HasGuard")
         ];
 
         public RelationshipTypesController(ADXDataService kusto)
@@ -61,7 +83,7 @@ namespace I3X4Kusto.Controllers
                 ? BulkResultItem<RelationshipType>.Ok(id, rt)
                 : BulkResultItem<RelationshipType>.NotFound(id, "Relationship type not found")).ToList();
 
-            return Ok(new BulkResponse<RelationshipType>(true, items));
+            return Ok(new BulkResponse<RelationshipType>(items.All(i => i.Success), items));
         }
     }
 }

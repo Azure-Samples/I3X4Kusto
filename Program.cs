@@ -1,9 +1,12 @@
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.ResponseCompression;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.OpenApi;
 using System;
 using System.Collections.Generic;
+using System.IO.Compression;
+using System.Linq;
 
 namespace I3X4Kusto
 {
@@ -16,6 +19,20 @@ namespace I3X4Kusto
             var builder = WebApplication.CreateBuilder(args);
 
             builder.Services.AddControllers();
+
+            // The i3X spec requires servers to honor Accept-Encoding: gzip. Enable gzip response
+            // compression (including over HTTPS) for the JSON payloads this API returns.
+            builder.Services.AddResponseCompression(options =>
+            {
+                options.EnableForHttps = true;
+                options.Providers.Add<GzipCompressionProvider>();
+                options.MimeTypes = ResponseCompressionDefaults.MimeTypes.Concat(new[] { "application/json" });
+            });
+
+            builder.Services.Configure<GzipCompressionProviderOptions>(options =>
+            {
+                options.Level = CompressionLevel.Fastest;
+            });
 
             builder.Services.AddOpenApi();
 
@@ -70,6 +87,9 @@ namespace I3X4Kusto
             });
 
             var app = builder.Build();
+
+            // Response compression must run early so downstream endpoint output is compressed.
+            app.UseResponseCompression();
 
             // Configure middleware pipeline
             if (app.Environment.IsDevelopment())
