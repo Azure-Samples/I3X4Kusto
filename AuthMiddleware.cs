@@ -8,28 +8,33 @@ using System.Threading.Tasks;
 namespace I3X4Kusto
 {
     /// <summary>
-    /// Mandatory HTTP Basic authentication for the i3X API. Credentials are supplied via the
-    /// <c>I3X_BASIC_AUTH_USERNAME</c> and <c>I3X_BASIC_AUTH_PASSWORD</c> environment variables. Every request
-    /// must carry a matching <c>Authorization: Basic</c> header, except:
+    /// Mandatory authentication for the i3X API. Two authentication methods are accepted:
+    ///   - HTTP Basic: credentials supplied via the <c>I3X_BASIC_AUTH_USERNAME</c> and
+    ///     <c>I3X_BASIC_AUTH_PASSWORD</c> environment variables (<c>Authorization: Basic</c> header).
+    ///   - OAuth2 / OpenID Connect bearer tokens: enabled by setting <c>I3X_OAUTH2_AUTHORITY</c>
+    ///     (<c>Authorization: Bearer</c> header), validated by <see cref="OAuth2TokenValidator"/>.
+    /// A request is authorized when it satisfies EITHER method. The following are exempt:
     ///   - CORS preflight requests (<c>OPTIONS</c>), which must not require auth or the browser blocks them,
     ///   - the unauthenticated health/capabilities endpoint (<c>GET /v1/info</c>, per the i3X spec),
     ///   - the Swagger UI / OpenAPI documents.
-    /// Authentication cannot be turned off. If the credential environment variables are not configured the
-    /// API fails closed (HTTP 503) rather than serving requests without authentication.
+    /// Authentication cannot be turned off. If neither method is configured the API fails closed (HTTP 503)
+    /// rather than serving requests without authentication.
     /// </summary>
-    public sealed class BasicAuthMiddleware
+    public sealed class AuthMiddleware
     {
         private readonly RequestDelegate _next;
+        private readonly OAuth2TokenValidator _oauth;
         private readonly string _username;
         private readonly string _password;
-        private readonly bool _configured;
+        private readonly bool _basicConfigured;
 
-        public BasicAuthMiddleware(RequestDelegate next)
+        public AuthMiddleware(RequestDelegate next, OAuth2TokenValidator oauth)
         {
             _next = next;
+            _oauth = oauth;
             _username = Environment.GetEnvironmentVariable("I3X_BASIC_AUTH_USERNAME");
             _password = Environment.GetEnvironmentVariable("I3X_BASIC_AUTH_PASSWORD");
-            _configured = !string.IsNullOrEmpty(_username) && !string.IsNullOrEmpty(_password);
+            _basicConfigured = !string.IsNullOrEmpty(_username) && !string.IsNullOrEmpty(_password);
         }
 
         public async Task InvokeAsync(HttpContext context)
@@ -40,17 +45,20 @@ namespace I3X4Kusto
                 return;
             }
 
-            // Fail closed: authentication is mandatory, so refuse to serve if no credentials are configured.
-            if (!_configured)
+            // Fail closed: authentication is mandatory, so refuse to serve if no method is configured.
+            if (!_basicConfigured && !_oauth.Configured)
             {
                 context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
                 await context.Response.WriteAsync(
-                    "Authentication is not configured. Set I3X_BASIC_AUTH_USERNAME and I3X_BASIC_AUTH_PASSWORD.")
+                    "Authentication is not configured. Set I3X_BASIC_AUTH_USERNAME and I3X_BASIC_AUTH_PASSWORD, "
+                    + "and/or I3X_OAUTH2_AUTHORITY.")
                     .ConfigureAwait(false);
                 return;
             }
 
-            if (TryGetCredentials(context, out var user, out var pass) &&
+            // Method 1: HTTP Basic.
+            if (_basicConfigured &&
+                TryGetCredentials(context, out var user, out var pass) &&
                 FixedTimeEquals(user, _username) &&
                 FixedTimeEquals(pass, _password))
             {
@@ -58,9 +66,33 @@ namespace I3X4Kusto
                 return;
             }
 
+            // Method 2: OAuth2 / OpenID Connect bearer token.
+            if (_oauth.Configured &&
+                TryGetBearerToken(context, out var token) &&
+                await _oauth.ValidateAsync(token, context.RequestAborted).ConfigureAwait(false))
+            {
+                await _next(context).ConfigureAwait(false);
+                return;
+            }
+
             context.Response.StatusCode = StatusCodes.Status401Unauthorized;
-            context.Response.Headers.WWWAuthenticate = "Basic realm=\"i3X4Kusto\", charset=\"UTF-8\"";
+            context.Response.Headers.WWWAuthenticate = BuildChallenge();
             await context.Response.WriteAsync("Unauthorized").ConfigureAwait(false);
+        }
+
+        // Advertise every configured authentication scheme in the WWW-Authenticate challenge.
+        private string BuildChallenge()
+        {
+            var challenges = new System.Collections.Generic.List<string>(2);
+            if (_basicConfigured)
+            {
+                challenges.Add("Basic realm=\"i3X4Kusto\", charset=\"UTF-8\"");
+            }
+            if (_oauth.Configured)
+            {
+                challenges.Add("Bearer");
+            }
+            return string.Join(", ", challenges);
         }
 
         // Endpoints that must remain reachable without credentials.
@@ -109,6 +141,24 @@ namespace I3X4Kusto
 
             username = decoded.Substring(0, separator);
             password = decoded.Substring(separator + 1);
+            return true;
+        }
+
+        // Extracts the raw JWT from an "Authorization: Bearer <token>" header.
+        private static bool TryGetBearerToken(HttpContext context, out string token)
+        {
+            token = null;
+
+            string header = context.Request.Headers.Authorization;
+            if (string.IsNullOrEmpty(header) ||
+                !AuthenticationHeaderValue.TryParse(header, out var parsed) ||
+                !string.Equals(parsed.Scheme, "Bearer", StringComparison.OrdinalIgnoreCase) ||
+                string.IsNullOrEmpty(parsed.Parameter))
+            {
+                return false;
+            }
+
+            token = parsed.Parameter;
             return true;
         }
 
