@@ -47,16 +47,33 @@ namespace I3X4Kusto
                     Description = "Enter the I3X_BASIC_AUTH_USERNAME and I3X_BASIC_AUTH_PASSWORD credentials."
                 });
 
+                // OAuth2 / OpenID Connect bearer tokens are accepted as a second authentication method
+                // when I3X_OAUTH2_AUTHORITY is configured.
+                options.AddSecurityDefinition("bearer", new OpenApiSecurityScheme
+                {
+                    Type = SecuritySchemeType.Http,
+                    Scheme = "bearer",
+                    BearerFormat = "JWT",
+                    Description = "Enter an OAuth2 / OpenID Connect access token (JWT)."
+                });
+
                 options.AddSecurityRequirement(document => new OpenApiSecurityRequirement
                 {
                     {
                         new OpenApiSecuritySchemeReference("basic", document),
+                        new List<string>()
+                    },
+                    {
+                        new OpenApiSecuritySchemeReference("bearer", document),
                         new List<string>()
                     }
                 });
             });
 
             builder.Services.AddSingleton<ADXDataService>();
+
+            // OAuth2 bearer-token validator (second authentication method alongside HTTP Basic).
+            builder.Services.AddSingleton<OAuth2TokenValidator>();
 
             builder.Services.AddSingleton<SubscriptionStore>();
 
@@ -108,9 +125,9 @@ namespace I3X4Kusto
             // CORS must run before the endpoints so preflight requests are handled.
             app.UseCors(CorsPolicyName);
 
-            // HTTP Basic authentication
+            // Authentication (HTTP Basic and/or OAuth2 bearer tokens).
             // Runs after CORS so preflight OPTIONS requests are not challenged.
-            app.UseMiddleware<BasicAuthMiddleware>();
+            app.UseMiddleware<AuthMiddleware>();
 
             app.MapControllers();
 
