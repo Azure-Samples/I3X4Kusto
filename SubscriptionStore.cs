@@ -151,11 +151,21 @@ namespace I3X4Kusto
                 }
             }
 
-            /// <summary>Acknowledge (remove) all pending batches with sequenceNumber &lt;= lastSequenceNumber.</summary>
+            /// <summary>
+            /// Acknowledge pending batches. A <paramref name="lastSequenceNumber"/> of -1 (or any negative
+            /// value) clears the entire pending queue; otherwise all batches with sequenceNumber &lt;=
+            /// lastSequenceNumber are removed.
+            /// </summary>
             public void Acknowledge(long lastSequenceNumber)
             {
                 lock (_gate)
                 {
+                    if (lastSequenceNumber < 0)
+                    {
+                        _pending.Clear();
+                        return;
+                    }
+
                     _pending.RemoveAll(b => b.SequenceNumber <= lastSequenceNumber);
                 }
             }
