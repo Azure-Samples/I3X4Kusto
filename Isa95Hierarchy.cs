@@ -83,12 +83,27 @@ namespace I3X4Kusto
                 }
 
                 // The deepest container represents the asset; record its Subject so asset-level values work.
-                // Variables hang directly under it. When there is no ISA-95 context, the asset itself becomes
-                // a root node so its variables remain discoverable.
-                Node asset = parent != null ? AttachAssetToContainer(parent, row) : AddRootAsset(row);
-
-                // Variable leaf node (one per Name), attached under its asset/container.
-                AddVariable(row, asset);
+                // Variables hang directly under it. When there is no ISA-95 context (e.g. an aggregating OPC UA
+                // server), the variables hang under a synthetic Namespace container (keyed by the parsed
+                // NamespaceUri); if the metadata Name encodes a browse path, that path is expanded into folder
+                // containers so the tree renders as Namespace -> Folder -> ... -> Variable.
+                if (parent != null)
+                {
+                    Node asset = AttachAssetToContainer(parent, row);
+                    AddVariable(row, asset);
+                }
+                else
+                {
+                    Node namespaceContainer = GetOrCreateNamespaceContainer(row);
+                    if (namespaceContainer != null)
+                    {
+                        AddPathVariable(row, namespaceContainer);
+                    }
+                    else
+                    {
+                        AddVariable(row, AddAsset(null, row));
+                    }
+                }
             }
         }
 
@@ -130,9 +145,39 @@ namespace I3X4Kusto
             return container;
         }
 
-        private Node AddRootAsset(Dictionary<string, object> row)
+        private Node GetOrCreateNamespaceContainer(Dictionary<string, object> row)
         {
-            // No ISA-95 context: expose the asset itself as a root node keyed by its Subject.
+            // Group assets that lack an ISA-95 path under a synthetic container keyed by their namespace, so
+            // an aggregating server's flat set of writers renders as a Namespace -> Asset -> Variables tree.
+            // The namespace may arrive as a JSON array of URIs for multi-namespace assets; use the first.
+            string ns = FirstNamespace(Str(row, "NamespaceUri"));
+            if (string.IsNullOrEmpty(ns))
+            {
+                return null;
+            }
+
+            string containerId = ContainerIdPrefix + "ns:" + ns;
+            if (!_byId.TryGetValue(containerId, out var node))
+            {
+                node = new Node
+                {
+                    ElementId = containerId,
+                    DisplayName = NamespaceShortName(ns),
+                    Level = "Namespace",
+                    Kind = NodeKind.Container,
+                    NamespaceUri = ns,
+                    ParentId = null
+                };
+                _byId[containerId] = node;
+                AttachChild(null, node);
+            }
+            return node;
+        }
+
+        private Node AddAsset(Node parent, Dictionary<string, object> row)
+        {
+            // Expose the asset itself as a node keyed by its Subject, attached under the given parent
+            // (a namespace container) or, when none is available, as a root node.
             string subject = Str(row, "Subject");
             if (string.IsNullOrEmpty(subject))
             {
@@ -141,25 +186,121 @@ namespace I3X4Kusto
 
             if (!_byId.TryGetValue(subject, out var asset))
             {
+                // The Subject (dataset-writer id) is only the join key between metadata and telemetry; it is
+                // not meaningful to display. Use the DataSetName as the human-readable asset name, falling
+                // back to the Subject only if no DataSetName is available.
+                string dataSetName = Str(row, "DataSetName");
                 asset = new Node
                 {
                     ElementId = subject,
-                    DisplayName = subject,
+                    DisplayName = string.IsNullOrEmpty(dataSetName) ? subject : dataSetName,
                     Kind = NodeKind.Container,
                     Level = "Asset",
                     Subject = subject,
+                    ParentId = parent?.ElementId,
                     NamespaceUri = string.IsNullOrEmpty(Str(row, "NamespaceUri"))
                         ? Isa95NamespaceUri
-                        : Str(row, "NamespaceUri")
+                        : FirstNamespace(Str(row, "NamespaceUri"))
                 };
 
                 _byId[subject] = asset;
-                AttachChild(null, asset);
+                AttachChild(parent, asset);
             }
             return asset;
         }
 
+        // A NamespaceUri may be a single URI or a JSON array of URIs (["a","b"]) carried through as a string.
+        // Return the first URI in either case.
+        private static string FirstNamespace(string raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw))
+            {
+                return raw;
+            }
+
+            string trimmed = raw.Trim();
+            if (trimmed.StartsWith('[') && trimmed.EndsWith(']'))
+            {
+                try
+                {
+                    string[] parsed = System.Text.Json.JsonSerializer.Deserialize<string[]>(trimmed);
+                    if (parsed is { Length: > 0 })
+                    {
+                        return parsed[0];
+                    }
+                }
+                catch (System.Text.Json.JsonException)
+                {
+                    // Not valid JSON; fall through and return the raw value.
+                }
+            }
+
+            return raw;
+        }
+
+        // Short, human-readable label for a namespace URI (its last non-empty path segment).
+        private static string NamespaceShortName(string uri)
+        {
+            if (string.IsNullOrEmpty(uri))
+            {
+                return uri;
+            }
+
+            string trimmed = uri.TrimEnd('/');
+            int lastSlash = trimmed.LastIndexOf('/');
+            return lastSlash >= 0 ? trimmed[(lastSlash + 1)..] : trimmed;
+        }
+
         private void AddVariable(Dictionary<string, object> row, Node asset)
+        {
+            AddVariable(row, asset, null);
+        }
+
+        // Expands a browse-path Name ("Folder/Sub/Value") into intermediate folder containers under the given
+        // namespace container, attaching the variable leaf (named after the last path segment) at the bottom.
+        private void AddPathVariable(Dictionary<string, object> row, Node namespaceContainer)
+        {
+            string name = Str(row, "Name");
+            if (string.IsNullOrEmpty(name))
+            {
+                return;
+            }
+
+            string[] segments = name.Split('/', StringSplitOptions.RemoveEmptyEntries);
+            if (segments.Length <= 1)
+            {
+                // No real path: keep the variable directly under the namespace container.
+                AddVariable(row, namespaceContainer);
+                return;
+            }
+
+            Node parent = namespaceContainer;
+            string containerId = namespaceContainer.ElementId;
+            for (int i = 0; i < segments.Length - 1; i++)
+            {
+                containerId = containerId + "/" + segments[i];
+                if (!_byId.TryGetValue(containerId, out var folder))
+                {
+                    folder = new Node
+                    {
+                        ElementId = containerId,
+                        DisplayName = segments[i],
+                        Level = "Folder",
+                        Kind = NodeKind.Container,
+                        NamespaceUri = namespaceContainer.NamespaceUri,
+                        ParentId = parent.ElementId
+                    };
+                    _byId[containerId] = folder;
+                    AttachChild(parent, folder);
+                }
+                parent = folder;
+            }
+
+            // The variable keeps its full Name (used to join telemetry) but displays only the leaf segment.
+            AddVariable(row, parent, segments[^1]);
+        }
+
+        private void AddVariable(Dictionary<string, object> row, Node asset, string displayName)
         {
             string subject = Str(row, "Subject");
             string name = Str(row, "Name");
@@ -179,7 +320,7 @@ namespace I3X4Kusto
             var variable = new Node
             {
                 ElementId = variableId,
-                DisplayName = name,
+                DisplayName = string.IsNullOrEmpty(displayName) ? name : displayName,
                 Type = Str(row, "Type"),
                 DataType = Str(row, "DataType"),
                 BuiltInType = Str(row, "BuiltInType"),

@@ -153,9 +153,9 @@ namespace I3X4Kusto
             string query = NamespaceBySubjectPrelude
                          + "opcua_metadata_lkv\r\n"
                          + ResolveNamespaceUri() + "\r\n"
-                         + "| distinct Subject, Name, DisplayName, Type, DataType, BuiltInType, NodeId, "
+                         + "| distinct Subject, DataSetName, Name, DisplayName, Type, DataType, BuiltInType, NodeId, "
                          + "NamespaceUri, Enterprise, Site, Area, Line, Workcell\r\n"
-                         + "| project Subject, Name, DisplayName, Type, DataType, BuiltInType, NodeId, "
+                         + "| project Subject, DataSetName, Name, DisplayName, Type, DataType, BuiltInType, NodeId, "
                          + "NamespaceUri, Enterprise, Site, Area, Line, Workcell";
 
             return RunQueryRows(query);
