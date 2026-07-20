@@ -136,7 +136,7 @@ namespace I3X4Kusto
             if (container.Subject == null)
             {
                 container.Subject = Str(row, "Subject");
-                string assetNamespace = Str(row, "NamespaceUri");
+                string assetNamespace = FirstNamespace(Str(row, "NamespaceUri"));
                 if (!string.IsNullOrEmpty(assetNamespace))
                 {
                     container.NamespaceUri = assetNamespace;
@@ -325,7 +325,7 @@ namespace I3X4Kusto
                 DataType = Str(row, "DataType"),
                 BuiltInType = Str(row, "BuiltInType"),
                 NodeId = Str(row, "NodeId"),
-                NamespaceUri = Str(row, "NamespaceUri"),
+                NamespaceUri = FirstNamespace(Str(row, "NamespaceUri")),
                 Subject = subject,
                 VariableName = name,
                 Level = "Variable",
@@ -416,14 +416,30 @@ namespace I3X4Kusto
             /// name. Prefers the human-readable OPC UA built-in type name (e.g. "String", "Double"), then the
             /// standard DataType name resolved from its NodeId (e.g. "i=27" => "Integer"), then the raw
             /// DataType NodeId, then the field's Type/Description, then its Name. The same token is used for
-            /// objects and /objecttypes so their ids always agree.
+            /// objects and /objecttypes so their ids always agree. When the built-in type is Null/unknown and
+            /// nothing else resolves, it defaults to "Variant" (the OPC UA any-type) rather than an empty/Null id.
             /// </summary>
-            public string TypeToken =>
-                OpcUaBuiltInType.GetDisplayName(BuiltInType)
-                ?? OpcUaBuiltInType.GetDataTypeName(DataType)
-                ?? (!string.IsNullOrEmpty(DataType) ? DataType
-                : !string.IsNullOrEmpty(Type) ? Type
-                : VariableName);
+            public string TypeToken
+            {
+                get
+                {
+                    // BuiltInType 0 ("Null") means "no specific type"; treat it as unresolved so the DataType
+                    // and other hints get a chance before falling back to the Variant default.
+                    string builtIn = OpcUaBuiltInType.GetDisplayName(BuiltInType);
+                    if (builtIn == "Null")
+                    {
+                        builtIn = null;
+                    }
+
+                    string token = builtIn
+                        ?? OpcUaBuiltInType.GetDataTypeName(DataType)
+                        ?? (!string.IsNullOrEmpty(DataType) ? DataType
+                        : !string.IsNullOrEmpty(Type) ? Type
+                        : VariableName);
+
+                    return string.IsNullOrEmpty(token) ? "Variant" : token;
+                }
+            }
 
             /// <summary>True when this container node represents an asset (carries a Subject).</summary>
             public bool IsAsset => Kind == NodeKind.Container && !string.IsNullOrEmpty(Subject);
