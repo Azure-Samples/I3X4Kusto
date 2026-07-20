@@ -7,12 +7,22 @@ using System.Collections.Generic;
 using System.Data;
 using System.Diagnostics;
 using System.Linq;
+using System.Threading;
 
 namespace I3X4Kusto
 {
     public class ADXDataService
     {
         private ICslQueryProvider _queryProvider = null;
+
+        // Cache for the ISA-95 leaf-asset metadata. This query (opcua_metadata_lkv) is executed by nearly
+        // every /objects, /objecttypes, /namespaces and /subscriptions request; OPC UA metadata changes
+        // rarely, so caching it for a short TTL drastically cuts the query volume against ADX / the Fabric
+        // Eventhouse and avoids 429 throttling on small (e.g. F2) capacities. TTL is configurable via
+        // I3X_METADATA_CACHE_SECONDS (default 60, minimum 0 = disabled).
+        private readonly object _metadataCacheLock = new();
+        private List<Dictionary<string, object>> _metadataCache;
+        private DateTime _metadataCacheUtc = DateTime.MinValue;
 
         public void Connect()
         {
@@ -100,14 +110,24 @@ namespace I3X4Kusto
         {
             var rows = new List<Dictionary<string, object>>();
 
-            ClientRequestProperties clientRequestProperties = new ClientRequestProperties()
+            if (_queryProvider == null)
             {
-                ClientRequestId = Guid.NewGuid().ToString()
-            };
+                return rows;
+            }
 
-            try
+            // Retry on throttling (HTTP 429 / TooManyRequests). Small analytics capacities (e.g. a Fabric F2
+            // Eventhouse) throttle bursts of queries; a short bounded exponential backoff lets transient
+            // throttles recover instead of surfacing as errors. Combined with the ISA-95 metadata cache this
+            // keeps the query volume within capacity limits.
+            const int maxAttempts = 4;
+            for (int attempt = 1; attempt <= maxAttempts; attempt++)
             {
-                if (_queryProvider != null)
+                ClientRequestProperties clientRequestProperties = new ClientRequestProperties()
+                {
+                    ClientRequestId = Guid.NewGuid().ToString()
+                };
+
+                try
                 {
                     using (IDataReader reader = _queryProvider.ExecuteQuery(query, clientRequestProperties))
                     {
@@ -131,14 +151,43 @@ namespace I3X4Kusto
                             rows.Add(row);
                         }
                     }
+
+                    return rows;
                 }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine("RunADXQuery: " + ex.Message);
+                catch (Exception ex) when (IsThrottling(ex) && attempt < maxAttempts)
+                {
+                    // Exponential backoff: 0.5s, 1s, 2s (with a little jitter).
+                    int delayMs = (int)(500 * Math.Pow(2, attempt - 1)) + Random.Shared.Next(0, 250);
+                    Console.WriteLine($"RunADXQuery: throttled (429), retry {attempt}/{maxAttempts - 1} after {delayMs}ms");
+                    rows.Clear();
+                    Thread.Sleep(delayMs);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("RunADXQuery: " + ex.Message);
+                    return rows;
+                }
             }
 
             return rows;
+        }
+
+        // True when the exception represents a Kusto throttling / TooManyRequests (429) condition.
+        private static bool IsThrottling(Exception ex)
+        {
+            for (Exception e = ex; e != null; e = e.InnerException)
+            {
+                string m = e.Message;
+                if (!string.IsNullOrEmpty(m) &&
+                    (m.IndexOf("429", StringComparison.Ordinal) >= 0 ||
+                     m.IndexOf("TooManyRequests", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                     m.IndexOf("Throttl", StringComparison.OrdinalIgnoreCase) >= 0))
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         /// <summary>
@@ -150,6 +199,35 @@ namespace I3X4Kusto
         /// </summary>
         public List<Dictionary<string, object>> GetIsa95LeafAssets()
         {
+            int ttlSeconds = GetMetadataCacheSeconds();
+            if (ttlSeconds > 0)
+            {
+                lock (_metadataCacheLock)
+                {
+                    if (_metadataCache != null &&
+                        (DateTime.UtcNow - _metadataCacheUtc).TotalSeconds < ttlSeconds)
+                    {
+                        return _metadataCache;
+                    }
+                }
+            }
+
+            var rows = QueryIsa95LeafAssets();
+
+            if (ttlSeconds > 0)
+            {
+                lock (_metadataCacheLock)
+                {
+                    _metadataCache = rows;
+                    _metadataCacheUtc = DateTime.UtcNow;
+                }
+            }
+
+            return rows;
+        }
+
+        private List<Dictionary<string, object>> QueryIsa95LeafAssets()
+        {
             string query = NamespaceBySubjectPrelude
                          + "opcua_metadata_lkv\r\n"
                          + ResolveNamespaceUri() + "\r\n"
@@ -159,6 +237,18 @@ namespace I3X4Kusto
                          + "NamespaceUri, Enterprise, Site, Area, Line, Workcell";
 
             return RunQueryRows(query);
+        }
+
+        // TTL for the ISA-95 metadata cache, in seconds. Default 60, minimum 0 (disables the cache).
+        private static int GetMetadataCacheSeconds()
+        {
+            string raw = Environment.GetEnvironmentVariable("I3X_METADATA_CACHE_SECONDS");
+            if (int.TryParse(raw, out int seconds) && seconds >= 0)
+            {
+                return seconds;
+            }
+
+            return 60;
         }
     }
 }

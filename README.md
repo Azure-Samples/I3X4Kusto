@@ -19,6 +19,7 @@ This adapter implements the read/query and subscription surface of the [i3X 1.0 
 ## Optional Environment Variables
 * "I3X_CORS_ORIGINS": comma-separated list of allowed CORS origins. When unset, all origins are allowed (required so the browser-based CESMII i3X client can call the API cross-origin). Set this to lock CORS down to specific origins in production.
 * "I3X_STREAM_POLL_MS": the SSE stream / sync poll interval against Azure Data Explorer, in milliseconds. Default 2000, minimum 250.
+* "I3X_METADATA_CACHE_SECONDS": how long the ISA-95 object/namespace/type metadata (the `opcua_metadata_lkv` query that backs nearly every `/objects`, `/objecttypes` and `/namespaces` request) is cached in memory. OPC UA metadata changes rarely, so caching it sharply reduces the query volume against Azure Data Explorer or a Fabric Eventhouse and avoids `429 TooManyRequests` throttling on small capacities. Default 60, set to 0 to disable caching. Throttled queries are additionally retried with a short exponential backoff.
 * "I3X_OAUTH2_AUTHORITY": the OpenID Connect authority (issuer) base URL. Setting this enables OAuth2 bearer-token authentication. See [Security](#security).
 * "I3X_OAUTH2_AUDIENCE": expected audience (`aud`) claim(s) for OAuth2 access tokens; comma-separated for multiple values. When unset, the audience is not validated.
 * "I3X_OAUTH2_ISSUER": expected token issuer. When unset, the issuer advertised by the authority's OIDC metadata is used.
