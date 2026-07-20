@@ -224,6 +224,12 @@ namespace I3xKustoAdapter.Controllers
 
             try
             {
+                // Flush the response headers and an initial SSE comment immediately, so the stream is
+                // acknowledged as "open" right away (before the first ADX poll). This ensures opening a new
+                // stream succeeds promptly even while the superseded stream is still winding down.
+                await Response.WriteAsync(": stream opened\n\n", token).ConfigureAwait(false);
+                await Response.Body.FlushAsync(token).ConfigureAwait(false);
+
                 while (!token.IsCancellationRequested)
                 {
                     StageNewValues(sub);
