@@ -267,7 +267,8 @@ namespace I3xKustoAdapter.Controllers
                             if (dt > latest) latest = dt;
                             ts = ToRfc3339(dt);
                         }
-                        components[Str(row, "Name")] = new VQT(row.GetValueOrDefault("Value"), "Good", ts);
+                        components[Isa95Hierarchy.VariableId(node.Subject, Str(row, "Name"))] =
+                            new VQT(row.GetValueOrDefault("Value"), "Good", ts);
                     }
 
                     var result = new CurrentValueResult(
@@ -301,7 +302,8 @@ namespace I3xKustoAdapter.Controllers
                                     if (dt > latest) latest = dt;
                                     ts = ToRfc3339(dt);
                                 }
-                                components[Str(row, "Name")] = new VQT(row.GetValueOrDefault("Value"), "Good", ts);
+                                components[Isa95Hierarchy.VariableId(subj, Str(row, "Name"))] =
+                                    new VQT(row.GetValueOrDefault("Value"), "Good", ts);
                             }
                         }
                         if (components.Count == 0) components = null;
@@ -411,7 +413,8 @@ namespace I3xKustoAdapter.Controllers
                                 x.Ts == DateTime.MinValue ? "" : ToRfc3339(x.Ts)))
                             .ToList();
 
-                        components[nameGroup.Key] = new HistoricalValueResult(false, vqts, null);
+                        components[Isa95Hierarchy.VariableId(node.Subject, nameGroup.Key)] =
+                            new HistoricalValueResult(false, vqts, null);
                     }
 
                     var result = new HistoricalValueResult(
@@ -448,7 +451,8 @@ namespace I3xKustoAdapter.Controllers
                                         x.Ts == DateTime.MinValue ? "" : ToRfc3339(x.Ts)))
                                     .ToList();
 
-                                components[nameGroup.Key] = new HistoricalValueResult(false, vqts, null);
+                                components[Isa95Hierarchy.VariableId(subj, nameGroup.Key)] =
+                                    new HistoricalValueResult(false, vqts, null);
                             }
                         }
                         if (components.Count == 0) components = null;

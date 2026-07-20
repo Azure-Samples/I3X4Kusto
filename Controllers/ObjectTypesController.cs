@@ -10,10 +10,12 @@ namespace I3X4Kusto.Controllers
     {
         private readonly ADXDataService _kusto;
 
-        // Synthetic ISA-95 container level types. Container objects (Enterprise/Site/Area/Line/Workcell)
-        // carry a typeElementId of "ISA95:<Level>", so those types must be registered here for every
+        // Synthetic ISA-95 container level types. Container objects (Enterprise/Site/Area/Line/Workcell,
+        // plus the Namespace/Asset grouping levels synthesized for aggregating servers that expose no ISA-95
+        // path) carry a typeElementId of "ISA95:<Level>", so those types must be registered here for every
         // object's typeElementId to resolve.
-        private static readonly string[] Isa95Levels = { "Enterprise", "Site", "Area", "Line", "Workcell" };
+        private static readonly string[] Isa95Levels =
+            { "Enterprise", "Site", "Area", "Line", "Workcell", "Namespace", "Asset", "Folder" };
 
         private static IEnumerable<ObjectTypeResponse> Isa95ContainerTypes() =>
             Isa95Levels.Select(level => new ObjectTypeResponse(
